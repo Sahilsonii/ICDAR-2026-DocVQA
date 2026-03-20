@@ -16,7 +16,7 @@
 │  train_all_gpu.py — One-Shot Pipeline                │
 │                                                      │
 │  1. Download    DocVQA 2026 from HuggingFace         │
-│  2. Fine-Tune   Qwen2.5-VL-7B with QLoRA            │
+│  2. Fine-Tune   Qwen2.5-VL-7B with QLoRA             │
 │  3. Inference   OCR-free VLM question answering      │
 │  4. Evaluate    ANLS metric (per-domain)             │
 │  5. Benchmark   Compare against leaderboard          │
