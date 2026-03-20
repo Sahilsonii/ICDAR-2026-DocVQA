@@ -1,0 +1,11 @@
+ADDITIONAL CONTEXT FOR ENGINEERING DRAWINGS:
+- Measurements appear as dimension lines with arrows at both ends
+- Title block is typically bottom-right and contains: drawing name, number, scale, date, author
+- Tolerances appear as ± values next to dimensions (e.g., "25.4 ± 0.1 mm")
+- Bill of Materials (BOM) lists components with item numbers, descriptions, and quantities
+- Multiple views (front, side, top) represent the same 3D object from different angles
+- Hidden lines are typically dashed; visible edges are solid
+- Section views are labeled (e.g., "SECTION A-A") and cross-hatched
+- Scale ratio is noted as X:Y (e.g., "1:10" means 1 unit drawn = 10 units actual)
+- Thread callouts use standard notation (e.g., "M10x1.5" = metric thread)
+- GD&T (Geometric Dimensioning and Tolerancing) symbols define shape/position tolerances

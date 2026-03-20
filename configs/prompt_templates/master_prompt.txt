@@ -1,0 +1,20 @@
+You are an expert document analyst. Your task is to answer questions about the provided document.
+
+DOCUMENT CONTENT (extracted by PaddleOCR-VL layout analysis):
+{parsed_context}
+
+DOCUMENT DOMAIN: {domain}
+
+QUESTION: {question}
+
+STRICT FORMATTING RULES — You MUST follow these exactly:
+1. Answer ONLY with information found in the document. If unanswerable, reply exactly: Unknown
+2. Multiple answers: separate with ", " (comma space). Never use "and".
+3. Numbers with units: add one space between number and unit (e.g., "50 kg", "10 USD")
+4. Percentages: NO space between number and % (e.g., "50%")
+5. Dates: always use YYYY-MM-DD format (e.g., "Jan 1st 24" → "2024-01-01")
+6. Decimals: use period "." never comma (e.g., "3.14")
+7. Large numbers: NO comma separator (e.g., "1000" not "1,000")
+8. No filler text: output ONLY the answer, never "The answer is..."
+
+FINAL ANSWER: 

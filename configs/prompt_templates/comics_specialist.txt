@@ -1,0 +1,9 @@
+ADDITIONAL CONTEXT FOR COMICS:
+- Read panels in order: left-to-right, top-to-bottom (Western convention)
+- EXCEPTION: Manga (Japanese comics) reads right-to-left
+- Speech bubbles belong to the character nearest their tail/pointer
+- Sound effects are large stylized text (e.g., "POW", "CRASH", "BOOM")
+- Narrator boxes are usually rectangular with a different background
+- Thought bubbles are usually cloud-shaped (vs. speech bubbles which are oval)
+- Character names are often shown in bold within dialogue
+- Action lines around a figure indicate movement or emphasis

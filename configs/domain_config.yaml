@@ -1,0 +1,25 @@
+# Per-domain parser routing rules
+# Override DOMAIN_PARSER_MAP in parser_router.py at runtime.
+#
+# Valid backend values: "paddleocr_vl", "docling", "olmocr"
+#
+# These defaults are based on OmniDocBench benchmark analysis.
+# Adjust per domain after benchmarking on your hardware.
+
+domain_routing:
+  maps:                 docling   # Spatial layout, irregular text placement
+  comics:               docling   # Non-standard panels, rotated speech bubbles
+  engineering_drawing:  docling   # Dense technical annotation, dimension lines
+  science_poster:       docling   # Mixed visual/text, complex columns
+  infographics:         docling   # Non-standard layout, embedded data labels
+  science_paper:        docling        # Born-digital, clean two-column layout
+  business_report:      docling        # Born-digital, clean structured PDF
+  slide:                docling        # Clean layout, minimal OCR complexity
+
+# Routing fallback for unknown domains
+default_backend: docling
+
+# Quality gates — if OCR confidence average is below threshold, fall back to docling
+quality_thresholds:
+  min_avg_confidence: 0.4   # Below this → retry with docling (olmocr disabled on py3.10)
+  min_text_length: 50       # Below this char count → likely OCR failure

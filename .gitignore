@@ -1,0 +1,49 @@
+# Secrets
+.env
+
+# Data & outputs (too large for git)
+data/raw/
+data/processed/
+data/predictions/
+data/submissions/
+results/
+
+# Model artifacts
+.model_cache/
+checkpoints/
+runs/
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb~
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

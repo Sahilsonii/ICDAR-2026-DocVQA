@@ -1,0 +1,35 @@
+# DocVQA 2026 Pipeline Configuration
+# Strategy: QLoRA fine-tuned Qwen2.5-VL-7B + domain-aware parsing
+
+parsers:
+  paddleocr_vl:
+    lang: "en"
+    use_gpu: true
+    confidence_threshold: 0.5
+
+  docling:
+    output_format: "markdown"
+
+reasoner:
+  backend: "hf_api"  # Options: "hf_api" | "gemma_local"
+
+  hf_api:
+    model_id: "google/gemma-3-27b-it"
+    temperature: 0.1
+    max_output_tokens: 256
+
+  gemma_local:
+    model_id: "google/gemma-3-27b-it"
+    load_in_4bit: true
+    temperature: 0.0
+    max_new_tokens: 256
+
+pipeline:
+  cache_parsed_docs: true
+  save_intermediates: true
+  batch_size: 1
+
+output:
+  submission_path: "results/submission.json"
+  predictions_path: "results/predictions.json"
+  processed_path: "data/processed"

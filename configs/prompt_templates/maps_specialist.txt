@@ -1,0 +1,8 @@
+ADDITIONAL CONTEXT FOR MAPS:
+- Road types and names are visually encoded (line styles, colors)
+- Grid coordinates are alphanumeric (e.g., "E-10") — always uppercase the letter
+- Mileage is shown on road segments as small numbers between cities
+- Legend is typically in the corner — consult it for symbol meanings
+- Scale bars define distances: use them when answering distance questions
+- Compass rose indicates orientation (usually North at top)
+- Place names are in larger font than road labels
