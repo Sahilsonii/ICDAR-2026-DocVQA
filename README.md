@@ -199,6 +199,8 @@ Output includes per-domain breakdown and automatic leaderboard comparison:
 
 ---
 
+If your W&B account disables personal entities, set `WANDB_ENTITY` in `.env` to your team/workspace slug instead of your username.
+
 ## References
 
 | Resource | Link |

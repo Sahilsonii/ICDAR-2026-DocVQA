@@ -46,6 +46,97 @@ logging.basicConfig(
 )
 logger = logging.getLogger("train_all")
 
+
+def init_wandb_run(run_name, model_id, epochs, lr):
+    """Initialize a W&B run with a clearer error for entity misconfiguration."""
+    project = os.environ.get("WANDB_PROJECT", "docvqa2026").strip() or "docvqa2026"
+    entity = (os.environ.get("WANDB_ENTITY") or "").strip() or None
+
+    if entity is None:
+        logger.warning(
+            "WANDB_API_KEY is set but WANDB_ENTITY is empty. "
+            "If your W&B account disables personal entities, set WANDB_ENTITY "
+            "to your team/workspace slug."
+        )
+
+    import wandb
+
+    try:
+        return wandb.init(
+            project=project,
+            entity=entity,
+            name=run_name,
+            config={"model": model_id, "epochs": epochs, "lr": lr, "lora_r": 16},
+        )
+    except Exception as exc:
+        if "Personal entities are disabled" in str(exc):
+            raise RuntimeError(
+                "W&B rejected this run because personal entities are disabled for "
+                "the current account. Set WANDB_ENTITY in .env to your team/"
+                "workspace slug, not your username."
+            ) from exc
+        raise
+
+
+def _optimizer_mode_noop(self):
+    """Compatibility no-op for optimizers that do not implement train/eval."""
+    return None
+
+
+def patch_optimizer_compatibility(optimizer):
+    """Patch optimizer classes missing train/eval for newer Trainer loops."""
+    optimizer_cls = optimizer.__class__
+    patched_methods = []
+
+    if not hasattr(optimizer_cls, "train"):
+        optimizer_cls.train = _optimizer_mode_noop
+        patched_methods.append("train")
+
+    if not hasattr(optimizer_cls, "eval"):
+        optimizer_cls.eval = _optimizer_mode_noop
+        patched_methods.append("eval")
+
+    if patched_methods:
+        logger.warning(
+            "Patched optimizer %s with no-op %s() for Trainer compatibility.",
+            optimizer_cls.__name__,
+            " and ".join(patched_methods),
+        )
+
+
+class CompatibleTrainer:
+    """Custom Trainer that applies optimizer compatibility patches."""
+
+    def __new__(cls, *args, **kwargs):
+        """Create Trainer instance and patch its create_optimizer method."""
+        from transformers import Trainer
+
+        # Create the standard Trainer instance
+        trainer = Trainer(*args, **kwargs)
+
+        # Store original create_optimizer and create_optimizer_and_scheduler methods
+        original_create_optimizer = trainer.create_optimizer
+        original_create_optimizer_and_scheduler = trainer.create_optimizer_and_scheduler
+
+        def patched_create_optimizer():
+            """Create optimizer and apply compatibility patch."""
+            original_create_optimizer()
+            if trainer.optimizer is not None:
+                patch_optimizer_compatibility(trainer.optimizer)
+
+        def patched_create_optimizer_and_scheduler(num_training_steps):
+            """Create optimizer/scheduler and apply compatibility patch."""
+            original_create_optimizer_and_scheduler(num_training_steps)
+            if trainer.optimizer is not None:
+                patch_optimizer_compatibility(trainer.optimizer)
+
+        # Replace methods with patched versions
+        trainer.create_optimizer = patched_create_optimizer
+        trainer.create_optimizer_and_scheduler = patched_create_optimizer_and_scheduler
+
+        return trainer
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MODEL REGISTRY
 # ═══════════════════════════════════════════════════════════════════════════
@@ -249,15 +340,14 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
 
     # Initialize WandB with entity/project from .env
     if os.environ.get("WANDB_API_KEY"):
-        import wandb
-        wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "docvqa2026"),
-            entity=os.environ.get("WANDB_ENTITY"),
-            name=training_args.run_name,
-            config={"model": model_id, "epochs": epochs, "lr": lr, "lora_r": 16},
+        init_wandb_run(
+            run_name=training_args.run_name,
+            model_id=model_id,
+            epochs=epochs,
+            lr=lr,
         )
 
-    trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset)
+    trainer = CompatibleTrainer(model=model, args=training_args, train_dataset=train_dataset)
 
     logger.info("Starting QLoRA fine-tuning...")
     start_time = time.time()
