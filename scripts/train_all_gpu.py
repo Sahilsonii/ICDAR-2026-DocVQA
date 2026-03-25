@@ -85,6 +85,7 @@ def _optimizer_mode_noop(self):
 
 def patch_optimizer_compatibility(optimizer):
     """Patch optimizer classes missing train/eval for newer Trainer loops."""
+    # Patch the optimizer class
     optimizer_cls = optimizer.__class__
     patched_methods = []
 
@@ -96,11 +97,33 @@ def patch_optimizer_compatibility(optimizer):
         optimizer_cls.eval = _optimizer_mode_noop
         patched_methods.append("eval")
 
+    # Also patch the instance directly (for safety)
+    if not hasattr(optimizer, "train"):
+        optimizer.train = lambda: None
+    if not hasattr(optimizer, "eval"):
+        optimizer.eval = lambda: None
+
+    # If wrapped by accelerate, patch the underlying optimizer too
+    if hasattr(optimizer, "optimizer"):
+        underlying = optimizer.optimizer
+        underlying_cls = underlying.__class__
+        if not hasattr(underlying_cls, "train"):
+            underlying_cls.train = _optimizer_mode_noop
+            patched_methods.append(f"{underlying_cls.__name__}.train")
+        if not hasattr(underlying_cls, "eval"):
+            underlying_cls.eval = _optimizer_mode_noop
+            patched_methods.append(f"{underlying_cls.__name__}.eval")
+        # Patch underlying instance too
+        if not hasattr(underlying, "train"):
+            underlying.train = lambda: None
+        if not hasattr(underlying, "eval"):
+            underlying.eval = lambda: None
+
     if patched_methods:
         logger.warning(
             "Patched optimizer %s with no-op %s() for Trainer compatibility.",
             optimizer_cls.__name__,
-            " and ".join(patched_methods),
+            ", ".join(patched_methods),
         )
 
 
