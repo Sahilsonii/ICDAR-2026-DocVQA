@@ -116,7 +116,9 @@ class DocVQAPipeline:
                     "_doc_id": doc_id,
                     "_domain": domain,
                     "_question": qa["question"],
-                    "_ground_truth": qa.get("ground_truth"),
+                    # NOTE: Ground truth is NOT attached to predictions.
+                    # Evaluation must use a separate GT lookup from the dataset
+                    # to prevent data leakage.
                 })
 
         logger.info(f"Pipeline complete: {len(results)} answers generated")

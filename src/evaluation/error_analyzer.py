@@ -19,7 +19,7 @@ def analyze_errors(predictions_path: str, gt_map: dict, domain_map: dict):
     Analyze prediction errors to find systematic failure patterns.
 
     Args:
-        predictions_path: Path to full predictions JSON (with _ground_truth field).
+        predictions_path: Path to full predictions JSON.
         gt_map: dict of {question_id: ground_truth_answer}
         domain_map: dict of {question_id: domain}
 

@@ -13,35 +13,33 @@
        │
        ▼
 ┌──────────────────────────────────────────────────────┐
-│  train_all_gpu.py — One-Shot Pipeline                │
+│  train_all_gpu.py — Zero-Shot Pipeline               │
 │                                                      │
 │  1. Download    DocVQA 2026 from HuggingFace         │
-│  2. Fine-Tune   Qwen2.5-VL-7B with QLoRA             │
-│  3. Inference   OCR-free VLM question answering      │
-│  4. Evaluate    ANLS metric (per-domain)             │
-│  5. Benchmark   Compare against leaderboard          │
-│  6. Submit      Competition-ready JSON               │
+│  2. Parse       Docling text extraction per document  │
+│  3. Inference   Qwen2.5-VL (image + parsed text)     │
+│  4. Evaluate    ANLS metric (per-domain breakdown)   │
+│  5. Submit      Competition-ready JSON               │
 └──────────────────────────────────────────────────────┘
 ```
+
+### Approach (Uni-Parser Inspired)
+
+Our approach draws from insights in the [Uni-Parser](https://arxiv.org/abs/2512.15098) pipeline (1st place, 0.5125 ANLS):
+
+- **Parser + VLM fusion**: Docling extracts document text → injected as context into Qwen2.5-VL prompt alongside the image
+- **Domain-aware prompting**: Specialized prompt supplements for each of the 8 document domains (maps, comics, engineering, etc.)
+- **Official evaluation prompt**: Uses the exact `get_evaluation_prompt()` from the competition's `eval_utils.py`
+- **Zero-shot inference**: No training on val/test (per competition rules)
+- **Competition-compliant formatting**: Automatic date (→YYYY-MM-DD), number, percentage, and list formatting
 
 ### Models
 
 | Model | Params | Role | VRAM (4-bit) |
 |-------|--------|------|-------------|
-| [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | 7B | Primary VLM (fine-tuned) | ~10 GB |
+| [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | 7B | Primary VLM | ~10 GB |
 | [Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | 3B | Lighter alternative | ~5 GB |
-| [PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR) | — | Document OCR parsing | ~2 GB |
-| [Docling](https://github.com/DS4SD/docling) | — | PDF parsing (clean docs) | CPU |
-
-### Approach
-
-Our approach draws from insights in the [Uni-Parser](https://arxiv.org/abs/2512.15098) pipeline (1st place, 0.5125 ANLS):
-
-- **OCR-free when possible**: Qwen2.5-VL processes document images directly via its vision encoder, avoiding OCR-induced errors
-- **Domain-aware prompting**: Specialized prompt supplements for each of the 8 document domains (maps, comics, engineering, etc.)
-- **Official evaluation prompt**: Uses the exact `get_evaluation_prompt()` from the competition's `eval_utils.py`
-- **QLoRA fine-tuning**: 4-bit quantized training with LoRA adapters, allowing 7B model training on 16 GB GPUs
-- **Competition-compliant formatting**: Automatic date (→YYYY-MM-DD), number, percentage, and list formatting
+| [Docling](https://github.com/DS4SD/docling) | — | Document text extraction | CPU |
 
 ---
 
@@ -50,25 +48,23 @@ Our approach draws from insights in the [Uni-Parser](https://arxiv.org/abs/2512.
 ```
 docvqa2026/
 ├── scripts/
-│   ├── train_all_gpu.py         ⭐ One-shot: train → infer → evaluate → submit
+│   ├── train_all_gpu.py         ⭐ Zero-shot: parse → infer → evaluate → submit
 │   ├── download_data.py         Download dataset from HuggingFace
-│   ├── run_inference.py         OCR + reasoner inference pipeline
+│   ├── run_inference.py         Alternative OCR + reasoner pipeline
 │   ├── evaluate_local.py        ANLS evaluation
 │   └── prepare_submission.py    Validate submission JSON
 ├── src/
 │   ├── data_loader.py           Dataset loading & QA pair extraction
 │   ├── parser/                  Domain-aware document parsing
 │   │   ├── parser_router.py     Routes domains → parser backends
-│   │   ├── paddleocr_vl.py      PaddleOCR-VL (primary)
-│   │   ├── docling_parser.py    Docling (clean PDFs)
+│   │   ├── docling_parser.py    Docling (primary parser)
+│   │   ├── paddleocr_vl.py      PaddleOCR-VL (alternative)
 │   │   └── olmocr_parser.py     olmOCR (noisy scans)
 │   ├── reasoner/                Question answering
-│   │   ├── gemma_reasoner.py    Local Gemma 3 27B
-│   │   ├── hf_api_reasoner.py   HF Serverless API
 │   │   ├── prompt_builder.py    Domain-specific prompts
 │   │   └── answer_formatter.py  Post-processing rules
 │   ├── pipeline/
-│   │   └── docvqa_pipeline.py   End-to-end orchestrator
+│   │   └── docvqa_pipeline.py   Alternative orchestrator
 │   └── evaluation/
 │       ├── eval_utils.py        Official competition evaluation
 │       ├── local_evaluator.py   ANLS scoring
@@ -77,7 +73,7 @@ docvqa2026/
 ├── configs/                     YAML configs + prompt templates
 ├── tests/                       Unit + integration tests
 ├── report/                      ICDAR competition report template
-├── requirements.txt             Exact pinned versions (CUDA 12.1)
+├── requirements.txt             Pinned versions (CUDA 12.1)
 └── .env.example                 Environment variable template
 ```
 
@@ -92,7 +88,6 @@ git clone https://github.com/YOUR_USERNAME/docvqa2026.git
 cd docvqa2026
 python -m venv env
 source env/bin/activate        # Linux/Mac
-# env\Scripts\activate         # Windows
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
@@ -104,47 +99,74 @@ cp .env.example .env
 nano .env   # Add your HF_TOKEN (required)
 ```
 
-### 3. Run Everything (One Command)
+### 3. Run Pipeline
 
 ```bash
-python scripts/train_all_gpu.py
-```
+# Validation set: inference + ANLS evaluation
+python scripts/train_all_gpu.py --split val
 
-This downloads the dataset, fine-tunes the model, runs inference, evaluates with ANLS, benchmarks against the competition leaderboard, and saves a competition-ready submission JSON.
+# Test set: generate submission JSON
+python scripts/train_all_gpu.py --split test
+
+# Both at once
+python scripts/train_all_gpu.py --split both
+```
 
 **Options:**
 ```bash
-python scripts/train_all_gpu.py --model qwen-3b     # Smaller model
-python scripts/train_all_gpu.py --epochs 3           # More training
-python scripts/train_all_gpu.py --skip-training      # Zero-shot only
-python scripts/train_all_gpu.py --max-samples 50     # Quick debug
+python scripts/train_all_gpu.py --model qwen-3b         # Smaller model (~5 GB)
+python scripts/train_all_gpu.py --no-parser              # Skip Docling, VLM-only
+python scripts/train_all_gpu.py --max-samples 5          # Quick debug
+python scripts/train_all_gpu.py --adapter-path <PATH>    # Use fine-tuned adapter
 ```
 
 ### 4. Submit
 
 ```bash
-python scripts/prepare_submission.py results/submission_*.json
-# Upload at: https://rrc.cvc.uab.es/?ch=34&com=mymethods&task=1
+# Validate submission format first
+python scripts/prepare_submission.py results/submission_test_*.json
+
+# Then upload at:
+# https://rrc.cvc.uab.es/?ch=34&com=mymethods&task=1
 ```
 
 ---
 
-## Resume Training (If Interrupted)
+## Data Flow (No Leakage)
 
-If training crashes or gets interrupted, you can resume from the latest checkpoint:
-
-```bash
-# Quick resume (auto-detect latest checkpoint)
-python scripts/train_all_gpu.py --resume-auto --epochs 50
-
-# Or use the helper script
-python scripts/resume_training.py --resume
-
-# View checkpoint & W&B info
-python scripts/resume_training.py
+```
+                    ┌─────────────────────┐
+                    │  HuggingFace        │
+                    │  VLR-CVC/DocVQA-2026│
+                    └────────┬────────────┘
+                             │
+            ┌────────────────┴────────────────┐
+            │                                 │
+      prepare_eval_data()              prepare_eval_data()
+            │                                 │
+    ┌───────┴───────┐                ┌────────┴──────┐
+    │ eval_samples  │                │ ground_truth  │
+    │ (NO answers)  │                │ (separate)    │
+    └───────┬───────┘                └────────┬──────┘
+            │                                 │
+     parse_documents()                        │
+            │                                 │
+     run_inference()                          │
+            │                                 │
+    ┌───────┴───────┐                         │
+    │  predictions  │                         │
+    └───────┬───────┘                         │
+            │                                 │
+            └────────────┬────────────────────┘
+                         │
+              evaluate_and_benchmark()
+                         │
+                   ┌─────┴─────┐
+                   │ ANLS Score │
+                   └───────────┘
 ```
 
-**Detailed guide:** See [RESUME_GUIDE.md](RESUME_GUIDE.md)
+**Key**: The model NEVER sees ground truth. Evaluation uses a separate GT lookup.
 
 ---
 
@@ -152,10 +174,9 @@ python scripts/resume_training.py
 
 | Script | What it does | GPU? |
 |--------|-------------|:----:|
-| `train_all_gpu.py` | **One-shot pipeline**: train + infer + evaluate + benchmark + save | ✅ |
-| `resume_training.py` | Helper script to resume interrupted training | ❌ |
+| `train_all_gpu.py` | **Main pipeline**: parse → infer → evaluate → submit | ✅ |
 | `download_data.py` | Download DocVQA 2026 val/test sets from HuggingFace | ❌ |
-| `run_inference.py` | Run OCR→reasoner pipeline on a split | Depends |
+| `run_inference.py` | Alternative OCR→reasoner inference pipeline | Depends |
 | `evaluate_local.py` | Evaluate predictions JSON using ANLS | ❌ |
 | `prepare_submission.py` | Validate submission JSON format | ❌ |
 
@@ -188,7 +209,7 @@ Output includes per-domain breakdown and automatic leaderboard comparison:
 
 ## Competition Rules (Followed)
 
-- ✅ Training on any data **except** val/test competition sets is permitted
+- ✅ **No training on val/test** — zero-shot inference only
 - ✅ Answer format: `FINAL ANSWER: [answer]`
 - ✅ Dates → YYYY-MM-DD, Percentages → no space, Numbers → no comma separators
 - ✅ Multiple answers separated by `, ` (not "and")
@@ -201,7 +222,7 @@ Output includes per-domain breakdown and automatic leaderboard comparison:
 ## Hardware Requirements
 
 | Component | Minimum | Recommended |
-|-----------|---------|------------|
+|-----------|---------|-------------|
 | GPU VRAM | 8 GB (3B model) | 16+ GB (7B model) |
 | RAM | 16 GB | 32+ GB |
 | Storage | 50 GB | 100+ GB |
@@ -218,8 +239,6 @@ Output includes per-domain breakdown and automatic leaderboard comparison:
 | `WANDB_API_KEY` | ❌ Optional | [wandb.ai/authorize](https://wandb.ai/authorize) | Experiment tracking |
 
 ---
-
-If your W&B account disables personal entities, set `WANDB_ENTITY` in `.env` to your team/workspace slug instead of your username.
 
 ## References
 

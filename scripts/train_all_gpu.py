@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-ICDAR 2026 DocVQA — One-Shot Training, Inference & Evaluation
+ICDAR 2026 DocVQA — Zero-Shot Inference & Evaluation Pipeline
 ==============================================================
 Competition : https://rrc.cvc.uab.es/?ch=34
-Paper       : https://arxiv.org/abs/2504.01234
+Dataset     : https://huggingface.co/datasets/VLR-CVC/DocVQA-2026
 
-This script runs the FULL pipeline in one command:
-  1. Downloads DocVQA 2026 dataset from HuggingFace
-  2. Fine-tunes a Vision-Language Model with QLoRA
-  3. Runs inference on val/test split
-  4. Evaluates with official ANLS metric (per-domain breakdown)
-  5. Compares against competition leaderboard
-  6. Generates competition-ready submission JSON
+Architecture (Uni-Parser inspired):
+  1. Download DocVQA 2026 val/test from HuggingFace
+  2. Parse documents with Docling (text extraction for context)
+  3. Run zero-shot VLM inference with Qwen2.5-VL (image + parsed text)
+  4. Post-process answers (dates, numbers, percentages, etc.)
+  5. Evaluate with official ANLS metric + per-domain breakdown (val only)
+  6. Generate competition-ready submission JSON
+
+IMPORTANT: Competition rules forbid training on val/test sets.
+           This pipeline is INFERENCE ONLY (zero-shot or adapter-enhanced).
 
 Usage:
-    python scripts/train_all_gpu.py                              # Full pipeline (default: Qwen 7B)
-    python scripts/train_all_gpu.py --skip-training              # Inference + eval only
-    python scripts/train_all_gpu.py --epochs 3                   # Custom epochs
+    python scripts/train_all_gpu.py                              # Val: infer + eval
+    python scripts/train_all_gpu.py --split test                 # Test: submission JSON
+    python scripts/train_all_gpu.py --split both                 # Both val + test
     python scripts/train_all_gpu.py --model qwen-3b              # Smaller model
-    python scripts/train_all_gpu.py --resume-run-id <WANDB_ID>   # Resume a W&B run
-    python scripts/train_all_gpu.py --resume-checkpoint <PATH>   # Resume from checkpoint
-    python scripts/train_all_gpu.py --resume-auto                # Auto-resume latest checkpoint
+    python scripts/train_all_gpu.py --adapter-path <PATH>        # Fine-tuned adapter
+    python scripts/train_all_gpu.py --no-parser                  # Skip Docling, VLM-only
+    python scripts/train_all_gpu.py --max-samples 5              # Debug
 
 Models (select via --model):
     qwen-7b  : Qwen/Qwen2.5-VL-7B-Instruct  (default, ~10 GB VRAM with 4-bit)
@@ -51,7 +54,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("train_all")
+logger = logging.getLogger("docvqa_pipeline")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -59,11 +62,7 @@ logger = logging.getLogger("train_all")
 # ═══════════════════════════════════════════════════════════════════════════
 
 def free_gpu_memory(*objects):
-    """
-    Delete objects, run Python GC and empty the CUDA cache.
-    Call this after training before loading the model again for inference —
-    otherwise two 4-bit copies of the 7B model exceed 16 GB VRAM.
-    """
+    """Delete objects, run Python GC and empty the CUDA cache."""
     for obj in objects:
         try:
             del obj
@@ -75,132 +74,11 @@ def free_gpu_memory(*objects):
         torch.cuda.synchronize()
         freed = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
         logger.info(
-            "GPU cache cleared. Allocated: %.1f GB | Reserved: %.1f GB | Free (reserved): %.1f GB",
+            "GPU cache cleared. Allocated: %.1f GB | Reserved: %.1f GB | Free: %.1f GB",
             torch.cuda.memory_allocated() / 1e9,
             torch.cuda.memory_reserved() / 1e9,
             freed / 1e9,
         )
-
-
-def init_wandb_run(run_name, model_id, epochs, lr, resume_run_id=None):
-    """
-    Initialize a W&B run.
-
-    Parameters
-    ----------
-    resume_run_id : str or None
-        Pass the W&B run ID (e.g. "xdtedi7j") to resume an existing run.
-        Uses resume="allow" so the run is created fresh if the ID doesn't exist.
-        Pass None to always start a new run.
-    """
-    project = os.environ.get("WANDB_PROJECT", "docvqa2026").strip() or "docvqa2026"
-    entity = (os.environ.get("WANDB_ENTITY") or "").strip() or None
-
-    if entity is None:
-        logger.warning(
-            "WANDB_API_KEY is set but WANDB_ENTITY is empty. "
-            "If your W&B account disables personal entities, set WANDB_ENTITY "
-            "to your team/workspace slug."
-        )
-
-    import wandb
-
-    init_kwargs = dict(
-        project=project,
-        entity=entity,
-        name=run_name,
-        config={"model": model_id, "epochs": epochs, "lr": lr, "lora_r": 16},
-    )
-
-    if resume_run_id:
-        # resume="allow" — resumes from last logged step if the run exists,
-        # otherwise creates a new run with that ID.
-        init_kwargs["id"] = resume_run_id
-        init_kwargs["resume"] = "allow"
-        logger.info("W&B: resuming run ID '%s' (resume='allow')", resume_run_id)
-    else:
-        logger.info("W&B: starting a new run")
-
-    try:
-        return wandb.init(**init_kwargs)
-    except Exception as exc:
-        if "Personal entities are disabled" in str(exc):
-            raise RuntimeError(
-                "W&B rejected this run because personal entities are disabled for "
-                "the current account. Set WANDB_ENTITY in .env to your team/"
-                "workspace slug, not your username."
-            ) from exc
-        raise
-
-
-def _optimizer_mode_noop(self):
-    """Compatibility no-op for optimizers that do not implement train/eval."""
-    return None
-
-
-def patch_optimizer_compatibility(optimizer):
-    """Patch optimizer classes missing train/eval for newer Trainer loops."""
-    optimizer_cls = optimizer.__class__
-    patched_methods = []
-
-    if not hasattr(optimizer_cls, "train"):
-        optimizer_cls.train = _optimizer_mode_noop
-        patched_methods.append("train")
-    if not hasattr(optimizer_cls, "eval"):
-        optimizer_cls.eval = _optimizer_mode_noop
-        patched_methods.append("eval")
-    if not hasattr(optimizer, "train"):
-        optimizer.train = lambda: None
-    if not hasattr(optimizer, "eval"):
-        optimizer.eval = lambda: None
-
-    if hasattr(optimizer, "optimizer"):
-        underlying = optimizer.optimizer
-        underlying_cls = underlying.__class__
-        if not hasattr(underlying_cls, "train"):
-            underlying_cls.train = _optimizer_mode_noop
-            patched_methods.append(f"{underlying_cls.__name__}.train")
-        if not hasattr(underlying_cls, "eval"):
-            underlying_cls.eval = _optimizer_mode_noop
-            patched_methods.append(f"{underlying_cls.__name__}.eval")
-        if not hasattr(underlying, "train"):
-            underlying.train = lambda: None
-        if not hasattr(underlying, "eval"):
-            underlying.eval = lambda: None
-
-    if patched_methods:
-        logger.warning(
-            "Patched optimizer %s with no-op %s() for Trainer compatibility.",
-            optimizer_cls.__name__,
-            ", ".join(patched_methods),
-        )
-
-
-class CompatibleTrainer:
-    """Custom Trainer that applies optimizer compatibility patches."""
-
-    def __new__(cls, *args, **kwargs):
-        from transformers import Trainer
-
-        trainer = Trainer(*args, **kwargs)
-
-        original_create_optimizer = trainer.create_optimizer
-        original_create_optimizer_and_scheduler = trainer.create_optimizer_and_scheduler
-
-        def patched_create_optimizer():
-            original_create_optimizer()
-            if trainer.optimizer is not None:
-                patch_optimizer_compatibility(trainer.optimizer)
-
-        def patched_create_optimizer_and_scheduler(num_training_steps):
-            original_create_optimizer_and_scheduler(num_training_steps)
-            if trainer.optimizer is not None:
-                patch_optimizer_compatibility(trainer.optimizer)
-
-        trainer.create_optimizer = patched_create_optimizer
-        trainer.create_optimizer_and_scheduler = patched_create_optimizer_and_scheduler
-
-        return trainer
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -246,281 +124,163 @@ def download_dataset(split="val", cache_dir="data/raw"):
         logger.info(f"Loading cached {split} dataset from {cache_path}")
         return load_from_disk(str(cache_path))
 
-    logger.info(f"Downloading DocVQA 2026 {split} split...")
+    logger.info(f"Downloading DocVQA 2026 {split} split from HuggingFace...")
     dataset = load_dataset("VLR-CVC/DocVQA-2026", split=split)
     dataset.save_to_disk(str(cache_path))
-    logger.info(f"Saved {len(dataset)} samples to {cache_path}")
+    logger.info(f"Saved {len(dataset)} documents to {cache_path}")
     return dataset
 
 
-def prepare_training_data(dataset):
-    """Convert HuggingFace dataset into (image, question, answer) triplets."""
+def prepare_eval_data(dataset):
+    """
+    Convert dataset into inference samples (NO ground truth) + separate GT lookup.
+
+    This prevents data leakage: the model never sees answers during inference.
+    Ground truth is kept in a separate dict for post-inference evaluation only.
+
+    Returns:
+        eval_samples: List of dicts with image, question, question_id, domain, doc_id, pages
+                      (NO 'answer' key — model must not see ground truth)
+        ground_truth: Dict mapping question_id -> answer (empty for test split)
+    """
     from src.data_loader import get_all_qa_pairs
 
-    samples = []
+    eval_samples = []
+    ground_truth = {}
+
     for item in dataset:
         for qa in get_all_qa_pairs(item):
+            eval_samples.append({
+                "image": qa["pages"][0] if qa["pages"] else None,
+                "pages": qa["pages"],       # All pages for multi-page parsing
+                "question": qa["question"],
+                "question_id": qa["question_id"],
+                "domain": qa["doc_category"],
+                "doc_id": qa["doc_id"],
+                # NO "answer" key — inference must be blind to ground truth
+            })
             if qa["ground_truth"] is not None:
-                samples.append({
-                    "image": qa["pages"][0] if qa["pages"] else None,
-                    "question": qa["question"],
-                    "answer": qa["ground_truth"],
-                    "question_id": qa["question_id"],
-                    "domain": qa["doc_category"],
-                    "doc_id": qa["doc_id"],
-                })
-    logger.info(f"Prepared {len(samples)} QA training pairs")
-    return samples
+                ground_truth[qa["question_id"]] = qa["ground_truth"]
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 2 — TRAINING (QLoRA)
-# ═══════════════════════════════════════════════════════════════════════════
-def train_model(model_key, samples, epochs=100, batch_size=1, lr=2e-4,
-                output_dir="checkpoints", resume_run_id=None, resume_checkpoint=None):
-    """
-    Fine-tune a VLM with QLoRA (4-bit quantization + LoRA adapters).
-
-    Parameters
-    ----------
-    resume_run_id : str or None
-        W&B run ID to resume cloud logging from.
-    resume_checkpoint : str or None
-        Path to a HuggingFace Trainer checkpoint directory to resume from.
-        If None, training starts from scratch (no auto-detect here —
-        auto-detect happens in main() before this call).
-
-    At the end the model and trainer are explicitly deleted and the CUDA
-    cache is cleared so that run_inference() can load a fresh copy without
-    exceeding the 16 GB VRAM budget.
-    """
-    from transformers import (
-        AutoProcessor, AutoModelForVision2Seq,
-        BitsAndBytesConfig, TrainingArguments,
-    )
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
-    model_info = MODEL_REGISTRY[model_key]
-    model_id = model_info["model_id"]
-    output_path = Path(output_dir) / model_key
-
-    logger.info(f"═══ TRAINING: {model_id} ({model_info['params']}) ═══")
-    logger.info(f"  Category   : {model_info['category']}")
-    logger.info(f"  Epochs     : {epochs}  |  Samples: {len(samples)}")
-    if resume_checkpoint:
-        logger.info(f"  Resuming from checkpoint: {resume_checkpoint}")
-
-    # ── 4-bit quantization ────────────────────────────────────────────────
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-
-    # ── Cap image resolution ──────────────────────────────────────────────
-    # 512*28*28 ≈ 400k pixels → ~300 visual tokens (down from ~1024 at default).
-    # Must match the cap used at inference time.
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    processor.image_processor.min_pixels = 256 * 28 * 28
-    processor.image_processor.max_pixels = 512 * 28 * 28
-
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_id,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-    )
-    model = prepare_model_for_kbit_training(model)
-
-    # ── LoRA on LLM attention only ────────────────────────────────────────
-    lora_config = LoraConfig(
-        r=16, lora_alpha=32, lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-
-    # ── Freeze visual encoder ─────────────────────────────────────────────
-    # LoRA adapters only target LLM layers; keeping the vision encoder in
-    # train mode wastes ~3-4 GB storing activations for backprop.
-    _visual = (
-        getattr(model.base_model.model, "visual", None)
-        or getattr(getattr(model, "base_model", None), "visual", None)
-    )
-    if _visual is not None:
-        _visual.requires_grad_(False)
-        logger.info("Visual encoder frozen — saves ~3-4 GB activation memory.")
-    else:
-        logger.warning("Could not locate visual encoder to freeze; OOM risk remains.")
-
-    from src.evaluation.eval_utils import get_evaluation_prompt
-    system_prompt = get_evaluation_prompt()
-
-    # ── Dataset wrapper ───────────────────────────────────────────────────
-    class DocVQADataset(torch.utils.data.Dataset):
-        def __init__(self, data, proc, sys_prompt):
-            self.data = data
-            self.processor = proc
-            self.system_prompt = sys_prompt
-
-        def __len__(self):
-            return len(self.data)
-
-        def __getitem__(self, idx):
-            item = self.data[idx]
-            messages = [
-                {"role": "user", "content": [
-                    {"type": "image", "image": item["image"]},
-                    {"type": "text",
-                     "text": f"{self.system_prompt}\n\nQuestion: {item['question']}"},
-                ]},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": f"FINAL ANSWER: {item['answer']}"},
-                ]},
-            ]
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False
-            )
-            try:
-                from qwen_vl_utils import process_vision_info
-                image_inputs, _ = process_vision_info(messages)
-                inputs = self.processor(
-                    text=text, images=image_inputs,
-                    # 2048 is large enough to never truncate image tokens.
-                    # With max_pixels=512*28*28 the image token count is ~300,
-                    # so 2048 gives safe headroom.
-                    padding="max_length", max_length=2048,
-                    truncation=True, return_tensors="pt",
-                )
-            except (ImportError, Exception):
-                inputs = self.processor(
-                    text=text, images=item["image"],
-                    padding="max_length", max_length=2048,
-                    truncation=True, return_tensors="pt",
-                )
-
-            input_ids = inputs["input_ids"].squeeze(0)
-            attention_mask = inputs["attention_mask"].squeeze(0)
-            pixel_values = inputs.get("pixel_values")
-            if pixel_values is not None and pixel_values.dim() > 3:
-                pixel_values = pixel_values.squeeze(0)
-
-            result = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": input_ids.clone(),
-            }
-            if pixel_values is not None:
-                result["pixel_values"] = pixel_values
-            image_grid_thw = inputs.get("image_grid_thw")
-            if image_grid_thw is not None:
-                result["image_grid_thw"] = image_grid_thw
-            return result
-
-    train_dataset = DocVQADataset(samples, processor, system_prompt)
-
-    def collate_fn(batch):
-        result = {}
-        for key in batch[0].keys():
-            values = [item[key] for item in batch]
-            if key in ['input_ids', 'attention_mask', 'labels', 'pixel_values']:
-                result[key] = torch.stack(values)
-            elif key == 'image_grid_thw':
-                # Each value is a tensor of shape (num_images, 3).
-                result[key] = torch.cat(values, dim=0)
-            else:
-                result[key] = values
-        return result
-
-    training_args = TrainingArguments(
-        output_dir=str(output_path),
-        num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=8,
-        learning_rate=lr,
-        warmup_ratio=0.1,
-        weight_decay=0.01,
-        bf16=torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False,
-        fp16=not (torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False),
-        logging_steps=10,
-        save_strategy="epoch",
-        save_total_limit=2,
-        remove_unused_columns=False,
-        dataloader_pin_memory=True,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim="paged_adamw_8bit",
-        report_to="wandb" if os.environ.get("WANDB_API_KEY") else "none",
-        run_name=f"docvqa-{model_key}-{datetime.now().strftime('%Y%m%d_%H%M')}",
-    )
-
-    if os.environ.get("WANDB_API_KEY"):
-        init_wandb_run(
-            run_name=training_args.run_name,
-            model_id=model_id,
-            epochs=epochs,
-            lr=lr,
-            resume_run_id=resume_run_id,
+    # Sanity check: ensure no leakage
+    for s in eval_samples:
+        assert "answer" not in s, (
+            f"DATA LEAKAGE: Sample {s['question_id']} contains 'answer' key!"
         )
 
-    trainer = CompatibleTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        data_collator=collate_fn,
+    logger.info(
+        f"Prepared {len(eval_samples)} inference samples, "
+        f"{len(ground_truth)} ground truth answers available"
     )
+    if not ground_truth:
+        logger.info("No ground truth available (test split) — evaluation will be skipped")
 
-    logger.info("Starting QLoRA fine-tuning...")
-    start_time = time.time()
-    trainer.train(resume_from_checkpoint=resume_checkpoint)
-    elapsed = time.time() - start_time
-    logger.info(f"Training completed in {elapsed/60:.1f} minutes")
-
-    # ── Save adapter ──────────────────────────────────────────────────────
-    # adapter_path MUST be defined before the W&B log call below.
-    adapter_path = output_path / "final_adapter"
-    model.save_pretrained(str(adapter_path))
-    processor.save_pretrained(str(adapter_path))
-    logger.info(f"Adapter saved to {adapter_path}")
-
-    # ── Log final summary to W&B ──────────────────────────────────────────
-    if os.environ.get("WANDB_API_KEY"):
-        import wandb
-        wandb.log({"final_checkpoint_path": str(adapter_path)})
-        wandb.summary["total_training_time_minutes"] = elapsed / 60
-
-    # ── IMPORTANT: free VRAM before inference loads a second copy ─────────
-    # Training leaves ~12 GB allocated. Inference needs to load the same
-    # 4-bit model again. Without clearing first, two copies exceed 16 GB
-    # and bitsandbytes raises "Some modules dispatched on CPU/disk".
-    logger.info("Freeing GPU memory before inference...")
-    free_gpu_memory(trainer, model)
-
-    return str(adapter_path)
+    return eval_samples, ground_truth
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STEP 3 — INFERENCE
+# STEP 2 — DOCUMENT PARSING (Docling)
 # ═══════════════════════════════════════════════════════════════════════════
-def run_inference(model_key, adapter_path, samples, max_samples=None):
-    """Run inference with the fine-tuned model."""
+def parse_documents(samples, use_parser=True):
+    """
+    Parse all unique documents using the Docling parser for text extraction.
+
+    Follows the Uni-Parser approach: parse once per doc_id, then attach
+    the parsed text to each QA sample as supplemental context for the VLM.
+
+    Args:
+        samples: List of eval sample dicts
+        use_parser: If False, skip parsing (pure VLM-only mode)
+
+    Returns:
+        Dict mapping doc_id -> parsed_text (Markdown)
+    """
+    if not use_parser:
+        logger.info("Parser disabled (--no-parser). Using VLM-only mode.")
+        return {}
+
+    from src.parser.docling_parser import DoclingParser
+
+    parser = DoclingParser({"output_format": "markdown"})
+
+    # Find unique documents
+    unique_docs = {}
+    for s in samples:
+        if s["doc_id"] not in unique_docs:
+            unique_docs[s["doc_id"]] = {
+                "pages": s["pages"],
+                "domain": s["domain"],
+            }
+
+    logger.info(f"Parsing {len(unique_docs)} unique documents with Docling...")
+
+    doc_texts = {}
+    for doc_id, doc_info in unique_docs.items():
+        try:
+            parsed_text = parser.parse(doc_info["pages"])
+            doc_texts[doc_id] = parsed_text
+            logger.info(
+                f"  ✓ Parsed {doc_id} ({doc_info['domain']}): "
+                f"{len(parsed_text)} chars"
+            )
+        except Exception as e:
+            logger.warning(f"  ✗ Failed to parse {doc_id}: {e}")
+            doc_texts[doc_id] = ""
+
+    n_success = sum(1 for t in doc_texts.values() if t)
+    logger.info(
+        f"Parsing complete: {n_success}/{len(unique_docs)} documents parsed successfully"
+    )
+    return doc_texts
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STEP 3 — INFERENCE (Qwen VLM + parsed context)
+# ═══════════════════════════════════════════════════════════════════════════
+def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None):
+    """
+    Run zero-shot inference with Qwen VLM.
+
+    Combines:
+      - Image input (via Qwen2.5-VL vision encoder)
+      - Parsed document text from Docling (injected into prompt)
+      - Domain-specific prompt supplements
+      - Competition formatting rules
+
+    This is the Uni-Parser-inspired approach: the model sees both the
+    raw image AND the parsed text for maximum accuracy.
+
+    Args:
+        model_key: Key from MODEL_REGISTRY
+        adapter_path: Path to fine-tuned adapter (or None for zero-shot)
+        samples: List of dicts WITHOUT 'answer' key
+        doc_texts: Dict mapping doc_id -> parsed text from Docling
+        max_samples: Limit number of samples (for debugging)
+
+    Returns:
+        List of prediction dicts
+    """
     from transformers import AutoProcessor, AutoModelForVision2Seq, BitsAndBytesConfig
     from src.reasoner.answer_formatter import extract_and_format_answer
-    from src.evaluation.eval_utils import get_evaluation_prompt
+    from src.reasoner.prompt_builder import build_prompt
     from tqdm import tqdm
 
     model_info = MODEL_REGISTRY[model_key]
     model_id = model_info["model_id"]
     logger.info(f"═══ INFERENCE: {model_id} ═══")
 
-    # Log available VRAM so we can diagnose any future OOM quickly
+    if adapter_path:
+        logger.info(f"Mode: Adapter-enhanced ({adapter_path})")
+    else:
+        logger.info("Mode: Zero-shot")
+    logger.info(f"Parsed context: {'Enabled' if doc_texts else 'Disabled (VLM-only)'}")
+
+    # Log available VRAM
     if torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
         free = (torch.cuda.get_device_properties(0).total_memory
                 - torch.cuda.memory_allocated()) / 1e9
-        logger.info(f"VRAM available for inference load: {free:.1f} GB")
+        logger.info(f"VRAM: {free:.1f} GB free / {total:.1f} GB total")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -530,12 +290,10 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
     )
 
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    # Match the resolution cap used during training
     processor.image_processor.min_pixels = 256 * 28 * 28
     processor.image_processor.max_pixels = 512 * 28 * 28
 
-    # Force all layers onto GPU — cpu: "0GiB" prevents bitsandbytes from
-    # trying to offload to CPU (which 4-bit quantization does not support).
+    # Force all layers onto GPU
     total_vram = (
         torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
     )
@@ -554,7 +312,7 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
         )
         model = PeftModel.from_pretrained(base_model, adapter_path)
     else:
-        logger.info("Running zero-shot inference (no adapter)")
+        logger.info("Loading base model for zero-shot inference")
         model = AutoModelForVision2Seq.from_pretrained(
             model_id,
             quantization_config=bnb_config,
@@ -565,17 +323,24 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
         )
     model.eval()
 
-    system_prompt = get_evaluation_prompt()
-    if max_samples:
-        samples = samples[:max_samples]
-
     predictions = []
     for item in tqdm(samples, desc="Inference"):
+        # ── Build context-augmented prompt ────────────────────────────────
+        domain = item.get("domain", "unknown")
+        parsed_text = doc_texts.get(item["doc_id"], "")
+        
+        question_with_context = build_prompt(
+            question=item["question"],
+            parsed_context=parsed_text,
+            domain=domain
+        )
+
+        # ── Construct VLM message ─────────────────────────────────────────
         messages = [{"role": "user", "content": [
             {"type": "image", "image": item["image"]},
-            {"type": "text",
-             "text": f"{system_prompt}\n\nQuestion: {item['question']}"},
+            {"type": "text", "text": question_with_context},
         ]}]
+
         try:
             from qwen_vl_utils import process_vision_info
             text = processor.apply_chat_template(
@@ -587,14 +352,15 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
             )
         except (ImportError, Exception):
             prompt = (
-                f"User: <image>\n{system_prompt}\n\n"
-                f"Question: {item['question']}\nAssistant:"
+                f"User: <image>\n{question_with_context}\nAssistant:"
             )
             inputs = processor(text=prompt, images=item["image"], return_tensors="pt")
 
         inputs = inputs.to(model.device)
         with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=256, do_sample=False)
+            generated_ids = model.generate(
+                **inputs, max_new_tokens=256, do_sample=False
+            )
 
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         full_output = processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
@@ -604,9 +370,9 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
             "question_id": item["question_id"],
             "answer": formatted,
             "full_answer": full_output,
-            "_domain": item["domain"],
-            "_ground_truth": item.get("answer"),
+            "_domain": domain,
             "_question": item["question"],
+            # NOTE: No _ground_truth — evaluation uses separate GT lookup
         })
 
     logger.info(f"Inference complete: {len(predictions)} predictions")
@@ -617,19 +383,41 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 4 — EVALUATION + BENCHMARKING
 # ═══════════════════════════════════════════════════════════════════════════
-def evaluate_and_benchmark(predictions, model_key):
-    """Evaluate with ANLS and print comparison against competition leaderboard."""
+def evaluate_and_benchmark(predictions, ground_truth, model_key):
+    """
+    Evaluate predictions against ground truth and compare to leaderboard.
+
+    Args:
+        predictions: List of prediction dicts from run_inference()
+        ground_truth: Dict mapping question_id -> answer (from prepare_eval_data)
+        model_key: Key from MODEL_REGISTRY
+
+    Note: ground_truth is a SEPARATE data structure from predictions.
+          This prevents data leakage.
+    """
     from src.evaluation.local_evaluator import compute_anls
+
+    if not ground_truth:
+        logger.warning("No ground truth available — skipping evaluation")
+        return {"overall_anls": None, "per_domain": {}, "total_evaluated": 0}
 
     domain_scores = {}
     all_scores = []
+    missing_gt = 0
 
     for pred in predictions:
-        gt = pred.get("_ground_truth", "")
-        if gt:
-            score = compute_anls(pred["answer"], gt)
-            all_scores.append(score)
-            domain_scores.setdefault(pred.get("_domain", "unknown"), []).append(score)
+        qid = pred["question_id"]
+        gt = ground_truth.get(qid)
+        if gt is None:
+            missing_gt += 1
+            continue
+        score = compute_anls(pred["answer"], gt)
+        all_scores.append(score)
+        domain = pred.get("_domain", "unknown")
+        domain_scores.setdefault(domain, []).append(score)
+
+    if missing_gt:
+        logger.warning(f"{missing_gt} predictions had no matching ground truth")
 
     overall = sum(all_scores) / len(all_scores) if all_scores else 0.0
     n_unknown = sum(1 for p in predictions if p["answer"] == "Unknown")
@@ -684,7 +472,6 @@ def evaluate_and_benchmark(predictions, model_key):
     cat_entries = [
         e for e in combined
         if e["category"] == our_cat
-        or (our_cat == "Up to 8B parameters" and e["category"] == "≤8B")
     ]
     if cat_entries:
         cat_rank = next(
@@ -709,12 +496,14 @@ def evaluate_and_benchmark(predictions, model_key):
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 5 — SAVE
 # ═══════════════════════════════════════════════════════════════════════════
-def save_results(predictions, eval_results, model_key, output_dir="results"):
-    """Save submission JSON, full predictions, evaluation summary, and benchmark."""
+def save_results(predictions, eval_results, model_key, split, output_dir="results"):
+    """Save submission JSON, full predictions, and evaluation summary."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # ── Submission JSON — matches official format ─────────────────────────
+    # Format: [{"question_id": ..., "answer": ..., "full_answer": ...}]
     submission = [
         {
             "question_id": p["question_id"],
@@ -723,25 +512,31 @@ def save_results(predictions, eval_results, model_key, output_dir="results"):
         }
         for p in predictions
     ]
-    sub_path = out / f"submission_{model_key}_{ts}.json"
+    sub_path = out / f"submission_{split}_{model_key}_{ts}.json"
     with open(sub_path, "w", encoding="utf-8") as f:
         json.dump(submission, f, indent=2, ensure_ascii=False)
 
-    pred_path = out / f"predictions_{model_key}_{ts}.json"
+    # ── Full predictions with metadata (for debugging) ────────────────────
+    pred_path = out / f"predictions_{split}_{model_key}_{ts}.json"
     with open(pred_path, "w", encoding="utf-8") as f:
         json.dump(predictions, f, indent=2, ensure_ascii=False, default=str)
 
-    eval_path = out / f"evaluation_{model_key}_{ts}.json"
-    eval_results["model"] = MODEL_REGISTRY[model_key]["model_id"]
-    eval_results["timestamp"] = ts
-    eval_results["leaderboard_snapshot"] = LEADERBOARD
-    with open(eval_path, "w", encoding="utf-8") as f:
-        json.dump(eval_results, f, indent=2)
+    # ── Evaluation summary ────────────────────────────────────────────────
+    if eval_results.get("overall_anls") is not None:
+        eval_path = out / f"evaluation_{split}_{model_key}_{ts}.json"
+        eval_results["model"] = MODEL_REGISTRY[model_key]["model_id"]
+        eval_results["timestamp"] = ts
+        eval_results["split"] = split
+        eval_results["leaderboard_snapshot"] = LEADERBOARD
+        with open(eval_path, "w", encoding="utf-8") as f:
+            json.dump(eval_results, f, indent=2)
 
     print(f"\n📁 Results saved to {out}/:")
-    print(f"   submission_{model_key}_{ts}.json    ← Upload to RRC portal")
-    print(f"   predictions_{model_key}_{ts}.json   ← Full debug predictions")
-    print(f"   evaluation_{model_key}_{ts}.json    ← Scores + leaderboard comparison")
+    print(f"   {sub_path.name:<50} ← Upload to RRC portal")
+    print(f"   {pred_path.name:<50} ← Full debug predictions")
+    if eval_results.get("overall_anls") is not None:
+        eval_name = f"evaluation_{split}_{model_key}_{ts}.json"
+        print(f"   {eval_name:<50} ← Scores + leaderboard")
     return str(sub_path)
 
 
@@ -750,126 +545,88 @@ def save_results(predictions, eval_results, model_key, output_dir="results"):
 # ═══════════════════════════════════════════════════════════════════════════
 def parse_args():
     p = argparse.ArgumentParser(
-        description="ICDAR 2026 DocVQA — One-Shot Training + Evaluation"
+        description="ICDAR 2026 DocVQA — Zero-Shot Inference & Evaluation"
     )
     p.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), default="qwen-7b",
-                   help="Model to train/evaluate (default: qwen-7b)")
-    p.add_argument("--epochs", type=int, default=100, help="Training epochs")
-    p.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    p.add_argument("--batch-size", type=int, default=1, help="Per-device batch size")
-    p.add_argument("--skip-training", action="store_true", help="Skip training")
-    p.add_argument("--max-samples", type=int, default=None, help="Limit samples (debug)")
+                   help="Model to use (default: qwen-7b)")
+    p.add_argument("--max-samples", type=int, default=None,
+                   help="Limit samples for debugging")
     p.add_argument("--adapter-path", type=str, default=None,
-                   help="Pre-trained adapter path")
-    p.add_argument("--split", choices=["val", "test"], default="val",
-                   help="Dataset split")
-    p.add_argument(
-        "--resume-run-id", type=str, default=None,
-        help=(
-            "W&B run ID to resume (e.g. 'xdtedi7j'). "
-            "Uses resume='allow': resumes from last logged step if the run "
-            "exists, otherwise starts fresh with that ID. "
-            "Find your run ID at wandb.ai or in the wandb/ folder."
-        ),
-    )
-    p.add_argument(
-        "--resume-checkpoint", type=str, default=None,
-        help=(
-            "Path to a Trainer checkpoint directory to resume from "
-            "(e.g. checkpoints/qwen-7b/checkpoint-50)."
-        ),
-    )
-    p.add_argument(
-        "--resume-auto", action="store_true",
-        help=(
-            "Auto-detect and resume from the latest checkpoint in the "
-            "checkpoints/<model>/ directory."
-        ),
-    )
+                   help="Path to a LoRA adapter (trained on EXTERNAL data only)")
+    p.add_argument("--split", choices=["val", "test", "both"], default="val",
+                   help="Dataset split: val (local eval), test (submission), both")
+    p.add_argument("--no-parser", action="store_true",
+                   help="Skip Docling parsing (pure VLM-only, no text context)")
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
+def run_pipeline_for_split(split, args):
+    """Run the full pipeline for a single split (val or test)."""
     info = MODEL_REGISTRY[args.model]
 
     print("\n" + "═" * 65)
-    print("  🚀 ICDAR 2026 DocVQA — Training Pipeline")
+    print(f"  🚀 ICDAR 2026 DocVQA — {split.upper()} Split")
     print("═" * 65)
     print(f"  Model      : {info['model_id']} ({info['params']})")
     print(f"  Category   : {info['category']}")
     if torch.cuda.is_available():
         print(f"  GPU        : {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM       : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"  VRAM       : {vram:.1f} GB")
     else:
         print("  GPU        : None (CPU mode — will be slow)")
-    print(f"  Split      : {args.split}")
-    print(f"  Training   : {'SKIP' if args.skip_training else f'{args.epochs} epochs'}")
-    if args.resume_run_id:
-        print(f"  W&B Resume : {args.resume_run_id}")
-    if args.resume_checkpoint:
-        print(f"  Checkpoint : {args.resume_checkpoint}")
-    if args.resume_auto:
-        print("  Resume     : AUTO-DETECT")
+    print(f"  Split      : {split}")
+    print(f"  Mode       : {'Adapter' if args.adapter_path else 'Zero-shot'}")
+    print(f"  Parser     : {'Docling' if not args.no_parser else 'Disabled (VLM-only)'}")
     print("═" * 65 + "\n")
 
-    # Step 1: Data
-    logger.info("━━━ STEP 1/5: Dataset ━━━")
-    dataset = download_dataset(split=args.split)
-    samples = prepare_training_data(dataset)
+    # Step 1: Download dataset
+    logger.info(f"━━━ STEP 1/5: Loading {split} dataset ━━━")
+    dataset = download_dataset(split=split)
 
-    # Step 2: Training
-    adapter_path = args.adapter_path
-    if not args.skip_training and args.split == "val":
-        logger.info("━━━ STEP 2/5: QLoRA Fine-Tuning ━━━")
+    # Prepare inference data — SEPARATE from ground truth
+    eval_samples, ground_truth = prepare_eval_data(dataset)
 
-        # ── Resolve checkpoint for resumption ────────────────────────────
-        resume_checkpoint = args.resume_checkpoint
-        if args.resume_auto and not resume_checkpoint:
-            checkpoint_dir = Path("checkpoints") / args.model
-            if checkpoint_dir.exists():
-                checkpoints = sorted(checkpoint_dir.glob("checkpoint-*"))
-                if checkpoints:
-                    resume_checkpoint = str(checkpoints[-1])
-                    logger.info(f"Auto-detected checkpoint: {resume_checkpoint}")
-                else:
-                    logger.info("--resume-auto set but no checkpoints found; starting fresh.")
-            else:
-                logger.info("--resume-auto set but checkpoint dir not found; starting fresh.")
+    # Step 2: Parse documents with Docling
+    logger.info("━━━ STEP 2/5: Document Parsing (Docling) ━━━")
+    doc_texts = parse_documents(eval_samples, use_parser=not args.no_parser)
 
-        adapter_path = train_model(
-            args.model, samples, args.epochs, args.batch_size, args.lr,
-            resume_run_id=args.resume_run_id,
-            resume_checkpoint=resume_checkpoint,
-        )
-    else:
-        logger.info("━━━ STEP 2/5: Training SKIPPED ━━━")
-        if not adapter_path:
-            default = Path("checkpoints") / args.model / "final_adapter"
-            if default.exists():
-                adapter_path = str(default)
-                logger.info(f"Found existing adapter: {adapter_path}")
+    # Step 3: Inference (model never sees ground truth)
+    logger.info("━━━ STEP 3/5: VLM Inference ━━━")
+    predictions = run_inference(
+        args.model, args.adapter_path, eval_samples, doc_texts, args.max_samples
+    )
 
-    # Step 3: Inference
-    logger.info("━━━ STEP 3/5: Inference ━━━")
-    predictions = run_inference(args.model, adapter_path, samples, args.max_samples)
-
-    # Step 4: Evaluation + Benchmarking
+    # Step 4: Evaluation (val only — test has no public GT)
     logger.info("━━━ STEP 4/5: Evaluation & Benchmarking ━━━")
-    eval_results = evaluate_and_benchmark(predictions, args.model)
+    eval_results = evaluate_and_benchmark(predictions, ground_truth, args.model)
 
-    # Step 5: Save
+    # Step 5: Save submission JSON
     logger.info("━━━ STEP 5/5: Saving Results ━━━")
-    sub_path = save_results(predictions, eval_results, args.model)
+    sub_path = save_results(predictions, eval_results, args.model, split)
 
     print("\n" + "═" * 65)
-    print("  ✅ PIPELINE COMPLETE")
+    print(f"  ✅ {split.upper()} PIPELINE COMPLETE")
     print("═" * 65)
-    print(f"  ANLS Score  : {eval_results['overall_anls']:.4f}")
-    print(f"  Rank        : #{eval_results.get('leaderboard_rank', '?')}")
+    if eval_results.get("overall_anls") is not None:
+        print(f"  ANLS Score  : {eval_results['overall_anls']:.4f}")
+        print(f"  Rank        : #{eval_results.get('leaderboard_rank', '?')}")
+    else:
+        print("  ANLS Score  : N/A (test split — submit to RRC portal)")
     print(f"  Submission  : {sub_path}")
     print(f"\n  Submit at: https://rrc.cvc.uab.es/?ch=34&com=mymethods&task=1")
     print("═" * 65 + "\n")
+
+    return sub_path, eval_results
+
+
+def main():
+    args = parse_args()
+
+    splits = ["val", "test"] if args.split == "both" else [args.split]
+
+    for split in splits:
+        run_pipeline_for_split(split, args)
 
 
 if __name__ == "__main__":
