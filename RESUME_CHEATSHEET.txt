@@ -1,0 +1,121 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                 ICDAR 2026 DocVQA — TRAINING RESUME CHEATSHEET                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌─ IF TRAINING CRASHES ────────────────────────────────────────────────────────┐
+│                                                                              │
+│  ▶️  Quick Resume:                                                           │
+│      python scripts/train_all_gpu.py --resume-auto --epochs 50               │
+│                                                                              │
+│  This will automatically find and resume from the latest checkpoint.          │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─ FIND YOUR CHECKPOINT & W&B RUN INFO ───────────────────────────────────────┐
+│                                                                              │
+│  📂 View checkpoint path:                                                    │
+│     python scripts/resume_training.py --show-checkpoint                     │
+│                                                                              │
+│  🔍 View W&B run ID:                                                         │
+│     python scripts/resume_training.py --show-wandb-id                       │
+│                                                                              │
+│  📋 View both + generate command:                                            │
+│     python scripts/resume_training.py                                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─ RESUME OPTIONS ─────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  1️⃣  Auto-detect latest checkpoint:                                         │
+│      python scripts/train_all_gpu.py --resume-auto --epochs 50               │
+│                                                                              │
+│  2️⃣  From specific checkpoint:                                               │
+│      python scripts/train_all_gpu.py \                                       │
+│        --resume-checkpoint checkpoints/qwen-7b/checkpoint-50 \              │
+│        --epochs 50                                                           │
+│                                                                              │
+│  3️⃣  From W&B run (synced to cloud):                                         │
+│      python scripts/train_all_gpu.py --resume-run-id <RUN_ID> --epochs 50   │
+│                                                                              │
+│  4️⃣  Using helper script:                                                    │
+│      python scripts/resume_training.py --resume --epochs 50                 │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─ FIND YOUR RUN ID FROM W&B ──────────────────────────────────────────────────┐
+│                                                                              │
+│  Option A: Online Dashboard                                                 │
+│    → https://wandb.ai/docvqa2026/docvqa2026/runs                            │
+│                                                                              │
+│  Option B: Local Folder                                                     │
+│    → Check: wandb/run-<TIMESTAMP>-<RUN_ID>/                                │
+│    → Example: wandb/run-20260325_135839-l607q83m/                           │
+│    → Run ID = "l607q83m"                                                     │
+│                                                                              │
+│  Option C: Terminal Output                                                  │
+│    → Look for: "🚀 View run at https://wandb.ai/.../runs/<RUN_ID>"          │
+│    → Extract the part after "/runs/"                                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─ CHECKPOINT LOCATIONS ───────────────────────────────────────────────────────┐
+│                                                                              │
+│  Default checkpoint structure:                                              │
+│    checkpoints/                                                             │
+│    └── qwen-7b/                    (model name)                             │
+│        ├── checkpoint-50/          (resume from here)                       │
+│        ├── checkpoint-100/                                                  │
+│        └── final_adapter/          (final trained model)                    │
+│                                                                              │
+│  List all checkpoints:                                                      │
+│    ls -la checkpoints/qwen-7b/                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─ EXAMPLES ───────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  Resume and train for 100 epochs:                                           │
+│    python scripts/train_all_gpu.py --resume-auto --epochs 100               │
+│                                                                              │
+│  Resume specific checkpoint:                                                │
+│    python scripts/train_all_gpu.py \                                        │
+│      --resume-checkpoint checkpoints/qwen-7b/checkpoint-128 \               │
+│      --epochs 50                                                            │
+│                                                                              │
+│  Resume a cloud run:                                                        │
+│    python scripts/train_all_gpu.py --resume-run-id xdtedi7j --epochs 50    │
+│                                                                              │
+│  Resume different model:                                                    │
+│    python scripts/train_all_gpu.py --model qwen-3b --resume-auto --epochs 50│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─ TROUBLESHOOT ───────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  ❌ No checkpoints found:                                                    │
+│     → Training may not have started                                         │
+│     → Check: ls -la checkpoints/                                            │
+│                                                                              │
+│  ❌ CUDA Out of Memory:                                                      │
+│     → Clear GPU: python -c "import torch; torch.cuda.empty_cache()"         │
+│     → Reduce batch size: --batch-size 1                                     │
+│                                                                              │
+│  ❌ W&B not syncing:                                                         │
+│     → Check API key: echo $WANDB_API_KEY                                    │
+│     → Re-login: wandb login                                                 │
+│                                                                              │
+│  ❌ Checkpoint format error:                                                 │
+│     → Use full path: checkpoints/qwen-7b/checkpoint-50                      │
+│     → Not: checkpoint-50 or /checkpoint-50                                  │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─ MORE INFO ──────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  📖 Full documentation: RESUME_GUIDE.md                                      │
+│  🔗 W&B Dashboard: https://wandb.ai/docvqa2026/docvqa2026                   │
+│  💬 Help: Check README.md or run python scripts/resume_training.py -h       │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Last Updated: 2026-03-26

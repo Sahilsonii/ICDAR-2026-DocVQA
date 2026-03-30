@@ -129,11 +129,31 @@ python scripts/prepare_submission.py results/submission_*.json
 
 ---
 
+## Resume Training (If Interrupted)
+
+If training crashes or gets interrupted, you can resume from the latest checkpoint:
+
+```bash
+# Quick resume (auto-detect latest checkpoint)
+python scripts/train_all_gpu.py --resume-auto --epochs 50
+
+# Or use the helper script
+python scripts/resume_training.py --resume
+
+# View checkpoint & W&B info
+python scripts/resume_training.py
+```
+
+**Detailed guide:** See [RESUME_GUIDE.md](RESUME_GUIDE.md)
+
+---
+
 ## Scripts Reference
 
 | Script | What it does | GPU? |
 |--------|-------------|:----:|
 | `train_all_gpu.py` | **One-shot pipeline**: train + infer + evaluate + benchmark + save | ✅ |
+| `resume_training.py` | Helper script to resume interrupted training | ❌ |
 | `download_data.py` | Download DocVQA 2026 val/test sets from HuggingFace | ❌ |
 | `run_inference.py` | Run OCR→reasoner pipeline on a split | Depends |
 | `evaluate_local.py` | Evaluate predictions JSON using ANLS | ❌ |

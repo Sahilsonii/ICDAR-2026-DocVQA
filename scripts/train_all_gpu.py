@@ -14,16 +14,20 @@ This script runs the FULL pipeline in one command:
   6. Generates competition-ready submission JSON
 
 Usage:
-    python scripts/train_all_gpu.py                    # Full pipeline (default: Qwen 7B)
-    python scripts/train_all_gpu.py --skip-training    # Inference + eval only
-    python scripts/train_all_gpu.py --epochs 3         # Custom epochs
-    python scripts/train_all_gpu.py --model qwen-3b    # Smaller model
+    python scripts/train_all_gpu.py                              # Full pipeline (default: Qwen 7B)
+    python scripts/train_all_gpu.py --skip-training              # Inference + eval only
+    python scripts/train_all_gpu.py --epochs 3                   # Custom epochs
+    python scripts/train_all_gpu.py --model qwen-3b              # Smaller model
+    python scripts/train_all_gpu.py --resume-run-id <WANDB_ID>   # Resume a W&B run
+    python scripts/train_all_gpu.py --resume-checkpoint <PATH>   # Resume from checkpoint
+    python scripts/train_all_gpu.py --resume-auto                # Auto-resume latest checkpoint
 
 Models (select via --model):
     qwen-7b  : Qwen/Qwen2.5-VL-7B-Instruct  (default, ~10 GB VRAM with 4-bit)
     qwen-3b  : Qwen/Qwen2.5-VL-3B-Instruct  (~5 GB VRAM with 4-bit)
 """
 
+import gc
 import os
 import sys
 import json
@@ -33,6 +37,9 @@ import logging
 import argparse
 from pathlib import Path
 from datetime import datetime
+
+# ── OOM fix: reduce allocator fragmentation ───────────────────────────────
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -47,8 +54,45 @@ logging.basicConfig(
 logger = logging.getLogger("train_all")
 
 
-def init_wandb_run(run_name, model_id, epochs, lr):
-    """Initialize a W&B run with a clearer error for entity misconfiguration."""
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def free_gpu_memory(*objects):
+    """
+    Delete objects, run Python GC and empty the CUDA cache.
+    Call this after training before loading the model again for inference —
+    otherwise two 4-bit copies of the 7B model exceed 16 GB VRAM.
+    """
+    for obj in objects:
+        try:
+            del obj
+        except Exception:
+            pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        freed = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        logger.info(
+            "GPU cache cleared. Allocated: %.1f GB | Reserved: %.1f GB | Free (reserved): %.1f GB",
+            torch.cuda.memory_allocated() / 1e9,
+            torch.cuda.memory_reserved() / 1e9,
+            freed / 1e9,
+        )
+
+
+def init_wandb_run(run_name, model_id, epochs, lr, resume_run_id=None):
+    """
+    Initialize a W&B run.
+
+    Parameters
+    ----------
+    resume_run_id : str or None
+        Pass the W&B run ID (e.g. "xdtedi7j") to resume an existing run.
+        Uses resume="allow" so the run is created fresh if the ID doesn't exist.
+        Pass None to always start a new run.
+    """
     project = os.environ.get("WANDB_PROJECT", "docvqa2026").strip() or "docvqa2026"
     entity = (os.environ.get("WANDB_ENTITY") or "").strip() or None
 
@@ -61,13 +105,24 @@ def init_wandb_run(run_name, model_id, epochs, lr):
 
     import wandb
 
+    init_kwargs = dict(
+        project=project,
+        entity=entity,
+        name=run_name,
+        config={"model": model_id, "epochs": epochs, "lr": lr, "lora_r": 16},
+    )
+
+    if resume_run_id:
+        # resume="allow" — resumes from last logged step if the run exists,
+        # otherwise creates a new run with that ID.
+        init_kwargs["id"] = resume_run_id
+        init_kwargs["resume"] = "allow"
+        logger.info("W&B: resuming run ID '%s' (resume='allow')", resume_run_id)
+    else:
+        logger.info("W&B: starting a new run")
+
     try:
-        return wandb.init(
-            project=project,
-            entity=entity,
-            name=run_name,
-            config={"model": model_id, "epochs": epochs, "lr": lr, "lora_r": 16},
-        )
+        return wandb.init(**init_kwargs)
     except Exception as exc:
         if "Personal entities are disabled" in str(exc):
             raise RuntimeError(
@@ -85,25 +140,20 @@ def _optimizer_mode_noop(self):
 
 def patch_optimizer_compatibility(optimizer):
     """Patch optimizer classes missing train/eval for newer Trainer loops."""
-    # Patch the optimizer class
     optimizer_cls = optimizer.__class__
     patched_methods = []
 
     if not hasattr(optimizer_cls, "train"):
         optimizer_cls.train = _optimizer_mode_noop
         patched_methods.append("train")
-
     if not hasattr(optimizer_cls, "eval"):
         optimizer_cls.eval = _optimizer_mode_noop
         patched_methods.append("eval")
-
-    # Also patch the instance directly (for safety)
     if not hasattr(optimizer, "train"):
         optimizer.train = lambda: None
     if not hasattr(optimizer, "eval"):
         optimizer.eval = lambda: None
 
-    # If wrapped by accelerate, patch the underlying optimizer too
     if hasattr(optimizer, "optimizer"):
         underlying = optimizer.optimizer
         underlying_cls = underlying.__class__
@@ -113,7 +163,6 @@ def patch_optimizer_compatibility(optimizer):
         if not hasattr(underlying_cls, "eval"):
             underlying_cls.eval = _optimizer_mode_noop
             patched_methods.append(f"{underlying_cls.__name__}.eval")
-        # Patch underlying instance too
         if not hasattr(underlying, "train"):
             underlying.train = lambda: None
         if not hasattr(underlying, "eval"):
@@ -131,29 +180,23 @@ class CompatibleTrainer:
     """Custom Trainer that applies optimizer compatibility patches."""
 
     def __new__(cls, *args, **kwargs):
-        """Create Trainer instance and patch its create_optimizer method."""
         from transformers import Trainer
 
-        # Create the standard Trainer instance
         trainer = Trainer(*args, **kwargs)
 
-        # Store original create_optimizer and create_optimizer_and_scheduler methods
         original_create_optimizer = trainer.create_optimizer
         original_create_optimizer_and_scheduler = trainer.create_optimizer_and_scheduler
 
         def patched_create_optimizer():
-            """Create optimizer and apply compatibility patch."""
             original_create_optimizer()
             if trainer.optimizer is not None:
                 patch_optimizer_compatibility(trainer.optimizer)
 
         def patched_create_optimizer_and_scheduler(num_training_steps):
-            """Create optimizer/scheduler and apply compatibility patch."""
             original_create_optimizer_and_scheduler(num_training_steps)
             if trainer.optimizer is not None:
                 patch_optimizer_compatibility(trainer.optimizer)
 
-        # Replace methods with patched versions
         trainer.create_optimizer = patched_create_optimizer
         trainer.create_optimizer_and_scheduler = patched_create_optimizer_and_scheduler
 
@@ -167,24 +210,24 @@ MODEL_REGISTRY = {
     "qwen-7b": {
         "model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
         "params": "7B",
-        "category": "Up to 8B parameters",
+        "category": "≤8B",
     },
     "qwen-3b": {
         "model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
         "params": "3B",
-        "category": "Up to 8B parameters",
+        "category": "≤8B",
     },
 }
 
 # Competition leaderboard (as of 2026-03-20) for benchmarking
 LEADERBOARD = [
-    {"method": "Uni-Parser + Mix-MLLMs",     "category": ">35B",   "score": 0.5125},
+    {"method": "Uni-Parser + Mix-MLLMs",      "category": ">35B",   "score": 0.5125},
     {"method": "Uni-Parser + Gemini-3.1-Pro", "category": ">35B",   "score": 0.4625},
     {"method": "Gemini-3.1-Pro (Baseline)",   "category": ">35B",   "score": 0.3750},
     {"method": "Gemini-3-Flash (Baseline)",   "category": ">35B",   "score": 0.3563},
-    {"method": "Uni-Parser + Qwen3.5-27B",   "category": "8B-35B", "score": 0.2938},
+    {"method": "Uni-Parser + Qwen3.5-27B",    "category": "8B-35B", "score": 0.2938},
     {"method": "GPT-5.2 (Baseline)",          "category": ">35B",   "score": 0.2688},
-    {"method": "Uni-Parser + Qwen3.5-4B",    "category": "≤8B",    "score": 0.1875},
+    {"method": "Uni-Parser + Qwen3.5-4B",     "category": "≤8B",    "score": 0.1875},
     {"method": "Qwen3-VL-32B-Thinking",       "category": "8B-35B", "score": 0.1438},
     {"method": "Qwen3-VL-8B-Thinking",        "category": "≤8B",    "score": 0.0938},
     {"method": "Florence-2 + QLoRA",          "category": "≤8B",    "score": 0.0125},
@@ -233,15 +276,27 @@ def prepare_training_data(dataset):
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 2 — TRAINING (QLoRA)
 # ═══════════════════════════════════════════════════════════════════════════
-def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
-                output_dir="checkpoints"):
+def train_model(model_key, samples, epochs=100, batch_size=1, lr=2e-4,
+                output_dir="checkpoints", resume_run_id=None, resume_checkpoint=None):
     """
     Fine-tune a VLM with QLoRA (4-bit quantization + LoRA adapters).
-    Uses gradient checkpointing + 8-bit optimizer to minimize VRAM.
+
+    Parameters
+    ----------
+    resume_run_id : str or None
+        W&B run ID to resume cloud logging from.
+    resume_checkpoint : str or None
+        Path to a HuggingFace Trainer checkpoint directory to resume from.
+        If None, training starts from scratch (no auto-detect here —
+        auto-detect happens in main() before this call).
+
+    At the end the model and trainer are explicitly deleted and the CUDA
+    cache is cleared so that run_inference() can load a fresh copy without
+    exceeding the 16 GB VRAM budget.
     """
     from transformers import (
         AutoProcessor, AutoModelForVision2Seq,
-        BitsAndBytesConfig, TrainingArguments, Trainer,
+        BitsAndBytesConfig, TrainingArguments,
     )
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
@@ -250,10 +305,12 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
     output_path = Path(output_dir) / model_key
 
     logger.info(f"═══ TRAINING: {model_id} ({model_info['params']}) ═══")
-    logger.info(f"  Category : {model_info['category']}")
-    logger.info(f"  Epochs   : {epochs}  |  Samples: {len(samples)}")
+    logger.info(f"  Category   : {model_info['category']}")
+    logger.info(f"  Epochs     : {epochs}  |  Samples: {len(samples)}")
+    if resume_checkpoint:
+        logger.info(f"  Resuming from checkpoint: {resume_checkpoint}")
 
-    # 4-bit quantization
+    # ── 4-bit quantization ────────────────────────────────────────────────
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
@@ -261,7 +318,13 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
+    # ── Cap image resolution ──────────────────────────────────────────────
+    # 512*28*28 ≈ 400k pixels → ~300 visual tokens (down from ~1024 at default).
+    # Must match the cap used at inference time.
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    processor.image_processor.min_pixels = 256 * 28 * 28
+    processor.image_processor.max_pixels = 512 * 28 * 28
+
     model = AutoModelForVision2Seq.from_pretrained(
         model_id,
         quantization_config=bnb_config,
@@ -271,7 +334,7 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
     )
     model = prepare_model_for_kbit_training(model)
 
-    # LoRA on attention projections
+    # ── LoRA on LLM attention only ────────────────────────────────────────
     lora_config = LoraConfig(
         r=16, lora_alpha=32, lora_dropout=0.05,
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
@@ -280,11 +343,23 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Official competition prompt
+    # ── Freeze visual encoder ─────────────────────────────────────────────
+    # LoRA adapters only target LLM layers; keeping the vision encoder in
+    # train mode wastes ~3-4 GB storing activations for backprop.
+    _visual = (
+        getattr(model.base_model.model, "visual", None)
+        or getattr(getattr(model, "base_model", None), "visual", None)
+    )
+    if _visual is not None:
+        _visual.requires_grad_(False)
+        logger.info("Visual encoder frozen — saves ~3-4 GB activation memory.")
+    else:
+        logger.warning("Could not locate visual encoder to freeze; OOM risk remains.")
+
     from src.evaluation.eval_utils import get_evaluation_prompt
     system_prompt = get_evaluation_prompt()
 
-    # Dataset wrapper
+    # ── Dataset wrapper ───────────────────────────────────────────────────
     class DocVQADataset(torch.utils.data.Dataset):
         def __init__(self, data, proc, sys_prompt):
             self.data = data
@@ -299,7 +374,8 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
             messages = [
                 {"role": "user", "content": [
                     {"type": "image", "image": item["image"]},
-                    {"type": "text", "text": f"{self.system_prompt}\n\nQuestion: {item['question']}"},
+                    {"type": "text",
+                     "text": f"{self.system_prompt}\n\nQuestion: {item['question']}"},
                 ]},
                 {"role": "assistant", "content": [
                     {"type": "text", "text": f"FINAL ANSWER: {item['answer']}"},
@@ -312,14 +388,17 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
                 from qwen_vl_utils import process_vision_info
                 image_inputs, _ = process_vision_info(messages)
                 inputs = self.processor(
-                    text=[text], images=image_inputs,
-                    padding="max_length", max_length=512,
+                    text=text, images=image_inputs,
+                    # 2048 is large enough to never truncate image tokens.
+                    # With max_pixels=512*28*28 the image token count is ~300,
+                    # so 2048 gives safe headroom.
+                    padding="max_length", max_length=2048,
                     truncation=True, return_tensors="pt",
                 )
             except (ImportError, Exception):
                 inputs = self.processor(
                     text=text, images=item["image"],
-                    padding="max_length", max_length=512,
+                    padding="max_length", max_length=2048,
                     truncation=True, return_tensors="pt",
                 )
 
@@ -336,9 +415,25 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
             }
             if pixel_values is not None:
                 result["pixel_values"] = pixel_values
+            image_grid_thw = inputs.get("image_grid_thw")
+            if image_grid_thw is not None:
+                result["image_grid_thw"] = image_grid_thw
             return result
 
     train_dataset = DocVQADataset(samples, processor, system_prompt)
+
+    def collate_fn(batch):
+        result = {}
+        for key in batch[0].keys():
+            values = [item[key] for item in batch]
+            if key in ['input_ids', 'attention_mask', 'labels', 'pixel_values']:
+                result[key] = torch.stack(values)
+            elif key == 'image_grid_thw':
+                # Each value is a tensor of shape (num_images, 3).
+                result[key] = torch.cat(values, dim=0)
+            else:
+                result[key] = values
+        return result
 
     training_args = TrainingArguments(
         output_dir=str(output_path),
@@ -356,32 +451,54 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
         remove_unused_columns=False,
         dataloader_pin_memory=True,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",
         report_to="wandb" if os.environ.get("WANDB_API_KEY") else "none",
         run_name=f"docvqa-{model_key}-{datetime.now().strftime('%Y%m%d_%H%M')}",
     )
 
-    # Initialize WandB with entity/project from .env
     if os.environ.get("WANDB_API_KEY"):
         init_wandb_run(
             run_name=training_args.run_name,
             model_id=model_id,
             epochs=epochs,
             lr=lr,
+            resume_run_id=resume_run_id,
         )
 
-    trainer = CompatibleTrainer(model=model, args=training_args, train_dataset=train_dataset)
+    trainer = CompatibleTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=collate_fn,
+    )
 
     logger.info("Starting QLoRA fine-tuning...")
     start_time = time.time()
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     elapsed = time.time() - start_time
     logger.info(f"Training completed in {elapsed/60:.1f} minutes")
 
+    # ── Save adapter ──────────────────────────────────────────────────────
+    # adapter_path MUST be defined before the W&B log call below.
     adapter_path = output_path / "final_adapter"
     model.save_pretrained(str(adapter_path))
     processor.save_pretrained(str(adapter_path))
     logger.info(f"Adapter saved to {adapter_path}")
+
+    # ── Log final summary to W&B ──────────────────────────────────────────
+    if os.environ.get("WANDB_API_KEY"):
+        import wandb
+        wandb.log({"final_checkpoint_path": str(adapter_path)})
+        wandb.summary["total_training_time_minutes"] = elapsed / 60
+
+    # ── IMPORTANT: free VRAM before inference loads a second copy ─────────
+    # Training leaves ~12 GB allocated. Inference needs to load the same
+    # 4-bit model again. Without clearing first, two copies exceed 16 GB
+    # and bitsandbytes raises "Some modules dispatched on CPU/disk".
+    logger.info("Freeing GPU memory before inference...")
+    free_gpu_memory(trainer, model)
+
     return str(adapter_path)
 
 
@@ -389,7 +506,7 @@ def train_model(model_key, samples, epochs=2, batch_size=1, lr=2e-4,
 # STEP 3 — INFERENCE
 # ═══════════════════════════════════════════════════════════════════════════
 def run_inference(model_key, adapter_path, samples, max_samples=None):
-    """Run inference with the (optionally fine-tuned) model."""
+    """Run inference with the fine-tuned model."""
     from transformers import AutoProcessor, AutoModelForVision2Seq, BitsAndBytesConfig
     from src.reasoner.answer_formatter import extract_and_format_answer
     from src.evaluation.eval_utils import get_evaluation_prompt
@@ -399,25 +516,52 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
     model_id = model_info["model_id"]
     logger.info(f"═══ INFERENCE: {model_id} ═══")
 
+    # Log available VRAM so we can diagnose any future OOM quickly
+    if torch.cuda.is_available():
+        free = (torch.cuda.get_device_properties(0).total_memory
+                - torch.cuda.memory_allocated()) / 1e9
+        logger.info(f"VRAM available for inference load: {free:.1f} GB")
+
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
+
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    # Match the resolution cap used during training
+    processor.image_processor.min_pixels = 256 * 28 * 28
+    processor.image_processor.max_pixels = 512 * 28 * 28
+
+    # Force all layers onto GPU — cpu: "0GiB" prevents bitsandbytes from
+    # trying to offload to CPU (which 4-bit quantization does not support).
+    total_vram = (
+        torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
+    )
+    max_memory = {0: f"{int(total_vram * 0.90 / 1e9)}GiB", "cpu": "0GiB"}
 
     if adapter_path and Path(adapter_path).exists():
         logger.info(f"Loading fine-tuned adapter from {adapter_path}")
         from peft import PeftModel
         base_model = AutoModelForVision2Seq.from_pretrained(
-            model_id, quantization_config=bnb_config,
-            device_map="auto", trust_remote_code=True, torch_dtype=torch.bfloat16,
+            model_id,
+            quantization_config=bnb_config,
+            device_map="auto",
+            max_memory=max_memory,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
         )
         model = PeftModel.from_pretrained(base_model, adapter_path)
     else:
         logger.info("Running zero-shot inference (no adapter)")
         model = AutoModelForVision2Seq.from_pretrained(
-            model_id, quantization_config=bnb_config,
-            device_map="auto", trust_remote_code=True, torch_dtype=torch.bfloat16,
+            model_id,
+            quantization_config=bnb_config,
+            device_map="auto",
+            max_memory=max_memory,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
         )
     model.eval()
 
@@ -429,15 +573,23 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
     for item in tqdm(samples, desc="Inference"):
         messages = [{"role": "user", "content": [
             {"type": "image", "image": item["image"]},
-            {"type": "text", "text": f"{system_prompt}\n\nQuestion: {item['question']}"},
+            {"type": "text",
+             "text": f"{system_prompt}\n\nQuestion: {item['question']}"},
         ]}]
         try:
             from qwen_vl_utils import process_vision_info
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
             image_inputs, _ = process_vision_info(messages)
-            inputs = processor(text=[text], images=image_inputs, padding=True, return_tensors="pt")
+            inputs = processor(
+                text=[text], images=image_inputs, padding=True, return_tensors="pt"
+            )
         except (ImportError, Exception):
-            prompt = f"User: <image>\n{system_prompt}\n\nQuestion: {item['question']}\nAssistant:"
+            prompt = (
+                f"User: <image>\n{system_prompt}\n\n"
+                f"Question: {item['question']}\nAssistant:"
+            )
             inputs = processor(text=prompt, images=item["image"], return_tensors="pt")
 
         inputs = inputs.to(model.device)
@@ -458,6 +610,7 @@ def run_inference(model_key, adapter_path, samples, max_samples=None):
         })
 
     logger.info(f"Inference complete: {len(predictions)} predictions")
+    free_gpu_memory(model)
     return predictions
 
 
@@ -481,7 +634,6 @@ def evaluate_and_benchmark(predictions, model_key):
     overall = sum(all_scores) / len(all_scores) if all_scores else 0.0
     n_unknown = sum(1 for p in predictions if p["answer"] == "Unknown")
 
-    # ── Per-Domain Results ──
     print("\n" + "═" * 70)
     print("  📊 EVALUATION RESULTS — ANLS")
     print("═" * 70)
@@ -498,11 +650,12 @@ def evaluate_and_benchmark(predictions, model_key):
         bar = "█" * int(avg * 20) + "░" * (20 - int(avg * 20))
         print(f"  {domain:<25} {bar} {avg:.4f}  ({len(scores)} Qs)")
 
-    # ── Leaderboard Benchmarking ──
     model_info = MODEL_REGISTRY[model_key]
-    our_entry = {"method": f"Ours ({model_info['model_id'].split('/')[-1]})",
-                 "category": model_info["category"], "score": overall}
-
+    our_entry = {
+        "method": f"Ours ({model_info['model_id'].split('/')[-1]})",
+        "category": model_info["category"],
+        "score": overall,
+    }
     combined = LEADERBOARD + [our_entry]
     combined.sort(key=lambda x: x["score"], reverse=True)
 
@@ -518,19 +671,26 @@ def evaluate_and_benchmark(predictions, model_key):
         marker = " ◀ YOU" if is_ours else ""
         if is_ours:
             our_rank = i
-        print(f"  {i:<5} {entry['method']:<45} {entry['category']:<10} {entry['score']:.4f}{marker}")
+        print(
+            f"  {i:<5} {entry['method']:<45} "
+            f"{entry['category']:<10} {entry['score']:.4f}{marker}"
+        )
 
     print("═" * 70)
     if our_rank:
         print(f"\n  📍 Your rank: #{our_rank} out of {len(combined)} methods")
 
-    # ── Category-specific ranking ──
     our_cat = model_info["category"]
-    cat_entries = [e for e in combined if e["category"] == our_cat or
-                   (our_cat == "Up to 8B parameters" and e["category"] == "≤8B")]
+    cat_entries = [
+        e for e in combined
+        if e["category"] == our_cat
+        or (our_cat == "Up to 8B parameters" and e["category"] == "≤8B")
+    ]
     if cat_entries:
-        cat_rank = next((i+1 for i, e in enumerate(cat_entries)
-                         if e["method"].startswith("Ours")), None)
+        cat_rank = next(
+            (i + 1 for i, e in enumerate(cat_entries) if e["method"].startswith("Ours")),
+            None,
+        )
         if cat_rank:
             print(f"  📍 In '{our_cat}' category: #{cat_rank} out of {len(cat_entries)}")
 
@@ -553,25 +713,24 @@ def save_results(predictions, eval_results, model_key, output_dir="results"):
     """Save submission JSON, full predictions, evaluation summary, and benchmark."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Competition submission (strips internal fields)
     submission = [
-        {"question_id": p["question_id"], "answer": p["answer"],
-         "full_answer": p.get("full_answer", "")}
+        {
+            "question_id": p["question_id"],
+            "answer": p["answer"],
+            "full_answer": p.get("full_answer", ""),
+        }
         for p in predictions
     ]
     sub_path = out / f"submission_{model_key}_{ts}.json"
     with open(sub_path, "w", encoding="utf-8") as f:
         json.dump(submission, f, indent=2, ensure_ascii=False)
 
-    # Full predictions (for debugging)
     pred_path = out / f"predictions_{model_key}_{ts}.json"
     with open(pred_path, "w", encoding="utf-8") as f:
         json.dump(predictions, f, indent=2, ensure_ascii=False, default=str)
 
-    # Evaluation + benchmark summary
     eval_path = out / f"evaluation_{model_key}_{ts}.json"
     eval_results["model"] = MODEL_REGISTRY[model_key]["model_id"]
     eval_results["timestamp"] = ts
@@ -595,13 +754,38 @@ def parse_args():
     )
     p.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), default="qwen-7b",
                    help="Model to train/evaluate (default: qwen-7b)")
-    p.add_argument("--epochs", type=int, default=2, help="Training epochs")
+    p.add_argument("--epochs", type=int, default=100, help="Training epochs")
     p.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     p.add_argument("--batch-size", type=int, default=1, help="Per-device batch size")
     p.add_argument("--skip-training", action="store_true", help="Skip training")
     p.add_argument("--max-samples", type=int, default=None, help="Limit samples (debug)")
-    p.add_argument("--adapter-path", type=str, default=None, help="Pre-trained adapter path")
-    p.add_argument("--split", choices=["val", "test"], default="val", help="Dataset split")
+    p.add_argument("--adapter-path", type=str, default=None,
+                   help="Pre-trained adapter path")
+    p.add_argument("--split", choices=["val", "test"], default="val",
+                   help="Dataset split")
+    p.add_argument(
+        "--resume-run-id", type=str, default=None,
+        help=(
+            "W&B run ID to resume (e.g. 'xdtedi7j'). "
+            "Uses resume='allow': resumes from last logged step if the run "
+            "exists, otherwise starts fresh with that ID. "
+            "Find your run ID at wandb.ai or in the wandb/ folder."
+        ),
+    )
+    p.add_argument(
+        "--resume-checkpoint", type=str, default=None,
+        help=(
+            "Path to a Trainer checkpoint directory to resume from "
+            "(e.g. checkpoints/qwen-7b/checkpoint-50)."
+        ),
+    )
+    p.add_argument(
+        "--resume-auto", action="store_true",
+        help=(
+            "Auto-detect and resume from the latest checkpoint in the "
+            "checkpoints/<model>/ directory."
+        ),
+    )
     return p.parse_args()
 
 
@@ -612,15 +796,21 @@ def main():
     print("\n" + "═" * 65)
     print("  🚀 ICDAR 2026 DocVQA — Training Pipeline")
     print("═" * 65)
-    print(f"  Model    : {info['model_id']} ({info['params']})")
-    print(f"  Category : {info['category']}")
+    print(f"  Model      : {info['model_id']} ({info['params']})")
+    print(f"  Category   : {info['category']}")
     if torch.cuda.is_available():
-        print(f"  GPU      : {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM     : {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        print(f"  GPU        : {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM       : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     else:
-        print(f"  GPU      : None (CPU mode — will be slow)")
-    print(f"  Split    : {args.split}")
-    print(f"  Training : {'SKIP' if args.skip_training else f'{args.epochs} epochs'}")
+        print("  GPU        : None (CPU mode — will be slow)")
+    print(f"  Split      : {args.split}")
+    print(f"  Training   : {'SKIP' if args.skip_training else f'{args.epochs} epochs'}")
+    if args.resume_run_id:
+        print(f"  W&B Resume : {args.resume_run_id}")
+    if args.resume_checkpoint:
+        print(f"  Checkpoint : {args.resume_checkpoint}")
+    if args.resume_auto:
+        print("  Resume     : AUTO-DETECT")
     print("═" * 65 + "\n")
 
     # Step 1: Data
@@ -632,8 +822,25 @@ def main():
     adapter_path = args.adapter_path
     if not args.skip_training and args.split == "val":
         logger.info("━━━ STEP 2/5: QLoRA Fine-Tuning ━━━")
+
+        # ── Resolve checkpoint for resumption ────────────────────────────
+        resume_checkpoint = args.resume_checkpoint
+        if args.resume_auto and not resume_checkpoint:
+            checkpoint_dir = Path("checkpoints") / args.model
+            if checkpoint_dir.exists():
+                checkpoints = sorted(checkpoint_dir.glob("checkpoint-*"))
+                if checkpoints:
+                    resume_checkpoint = str(checkpoints[-1])
+                    logger.info(f"Auto-detected checkpoint: {resume_checkpoint}")
+                else:
+                    logger.info("--resume-auto set but no checkpoints found; starting fresh.")
+            else:
+                logger.info("--resume-auto set but checkpoint dir not found; starting fresh.")
+
         adapter_path = train_model(
             args.model, samples, args.epochs, args.batch_size, args.lr,
+            resume_run_id=args.resume_run_id,
+            resume_checkpoint=resume_checkpoint,
         )
     else:
         logger.info("━━━ STEP 2/5: Training SKIPPED ━━━")
