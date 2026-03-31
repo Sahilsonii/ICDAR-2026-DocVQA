@@ -320,6 +320,7 @@ def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None)
             max_memory=max_memory,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
         )
     model.eval()
 
@@ -336,8 +337,10 @@ def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None)
         )
 
         # ── Construct VLM message ─────────────────────────────────────────
+        # Cap image resolution to approx 634x634 equivalent memory size to prevent OOM
+        max_pixels = 512 * 28 * 28
         messages = [{"role": "user", "content": [
-            {"type": "image", "image": item["image"]},
+            {"type": "image", "image": item["image"], "max_pixels": max_pixels},
             {"type": "text", "text": question_with_context},
         ]}]
 
@@ -374,6 +377,10 @@ def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None)
             "_question": item["question"],
             # NOTE: No _ground_truth — evaluation uses separate GT lookup
         })
+
+        # Explicitly free memory to prevent VRAM leakage across loop iterations
+        del inputs, generated_ids, trimmed
+        torch.cuda.empty_cache()
 
     logger.info(f"Inference complete: {len(predictions)} predictions")
     free_gpu_memory(model)
