@@ -651,7 +651,11 @@ def main():
     if wandb_key:
         try:
             import wandb
-            wandb.login(key=wandb_key)
+            try:
+                wandb.login(key=wandb_key)
+            except Exception as e:
+                logger.warning(f"wandb login with .env key failed ({e}). Falling back to cached CLI credentials...")
+                
             wandb.init(
                 project=os.environ.get("WANDB_PROJECT", "docvqa2026"),
                 entity=os.environ.get("WANDB_ENTITY"),
