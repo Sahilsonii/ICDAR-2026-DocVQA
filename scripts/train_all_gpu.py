@@ -617,6 +617,27 @@ def run_pipeline_for_split(split, args):
     print(f"\n  Submit at: https://rrc.cvc.uab.es/?ch=34&com=mymethods&task=1")
     print("═" * 65 + "\n")
 
+    if os.environ.get("WANDB_API_KEY"):
+        try:
+            import wandb
+            if wandb.run is not None:
+                if eval_results.get("overall_anls") is not None:
+                    logs = {
+                        f"{split}/overall_anls": eval_results["overall_anls"],
+                        f"{split}/unknown_count": eval_results.get("unknown_count", 0)
+                    }
+                    for domain, score in eval_results.get("per_domain", {}).items():
+                        logs[f"{split}/domain/{domain}"] = score
+                    wandb.log(logs)
+                
+                # Save the submission JSON as a wandb artifact
+                artifact_name = f"submission_{split}_{args.model}".replace("-", "_")
+                artifact = wandb.Artifact(artifact_name, type="submission")
+                artifact.add_file(sub_path)
+                wandb.log_artifact(artifact)
+        except ImportError:
+            pass
+
     return sub_path, eval_results
 
 
@@ -625,8 +646,30 @@ def main():
 
     splits = ["val", "test"] if args.split == "both" else [args.split]
 
+    # Initialize Weights & Biases if API key is present
+    wandb_key = os.environ.get("WANDB_API_KEY")
+    if wandb_key:
+        try:
+            import wandb
+            wandb.login(key=wandb_key)
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "docvqa2026"),
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=f"zero_shot_{args.model}_{'both' if args.split=='both' else splits[0]}",
+                config=vars(args)
+            )
+            logger.info("Weights & Biases logging enabled")
+        except ImportError:
+            logger.warning("wandb is not installed. Run `pip install wandb` to enable tracking.")
+            wandb_key = None
+    else:
+        logger.info("WANDB_API_KEY not found in .env — skipping Weights & Biases logging")
+
     for split in splits:
         run_pipeline_for_split(split, args)
+
+    if wandb_key:
+        wandb.finish()
 
 
 if __name__ == "__main__":
