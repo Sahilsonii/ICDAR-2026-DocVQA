@@ -330,6 +330,11 @@ def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None)
         domain = item.get("domain", "unknown")
         parsed_text = doc_texts.get(item["doc_id"], "")
         
+        # ── OOM Prevention: Cap context length ────────────────────────────
+        MAX_PARSED_CHARS = 4000
+        if len(parsed_text) > MAX_PARSED_CHARS:
+            parsed_text = parsed_text[:MAX_PARSED_CHARS] + "\n[...truncated due to memory limits]"
+
         question_with_context = build_prompt(
             question=item["question"],
             parsed_context=parsed_text,
@@ -337,10 +342,18 @@ def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None)
         )
 
         # ── Construct VLM message ─────────────────────────────────────────
-        # Cap image resolution to approx 634x634 equivalent memory size to prevent OOM
-        max_pixels = 512 * 28 * 28
+        # OOM Prevention: Dynamically shrink huge images before tokenization
+        img = item["image"]
+        max_dim = 1024
+        if max(img.size) > max_dim:
+            import PIL
+            from PIL import Image
+            ratio = max_dim / max(img.size)
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            img = img.resize(new_size, PIL.Image.Resampling.LANCZOS)
+
         messages = [{"role": "user", "content": [
-            {"type": "image", "image": item["image"], "max_pixels": max_pixels},
+            {"type": "image", "image": img},
             {"type": "text", "text": question_with_context},
         ]}]
 
