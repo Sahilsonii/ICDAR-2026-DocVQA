@@ -40,6 +40,10 @@ import logging
 import argparse
 from pathlib import Path
 from datetime import datetime
+from PIL import Image
+
+# Disable PIL decompression bomb limits for huge document scans
+Image.MAX_IMAGE_PIXELS = None
 
 # ── OOM fix: reduce allocator fragmentation ───────────────────────────────
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
