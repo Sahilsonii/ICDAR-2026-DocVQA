@@ -406,7 +406,20 @@ def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samp
         torch.cuda.empty_cache()
 
     logger.info(f"Inference complete: {len(predictions)} predictions")
-    free_gpu_memory(model)
+
+    # ── Critical: explicitly delete model + processor to release all VRAM ──
+    # free_gpu_memory(model) alone does NOT work because the caller still holds
+    # a reference via the `model` local variable inside run_inference — the del
+    # inside free_gpu_memory only removes the copy passed in, not the original.
+    del model, processor
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        alloc = torch.cuda.memory_allocated() / 1e9
+        reserv = torch.cuda.memory_reserved() / 1e9
+        logger.info(f"VRAM after model unload: {alloc:.1f} GB allocated | {reserv:.1f} GB reserved")
+
     return predictions
 
 
@@ -701,8 +714,17 @@ def main():
     else:
         logger.info("WANDB_API_KEY not found in .env — skipping Weights & Biases logging")
 
-    for split in splits:
+    for i, split in enumerate(splits):
         run_pipeline_for_split(split, args)
+
+        # Hard VRAM flush between splits so the next split starts on a clean GPU
+        if i < len(splits) - 1:
+            logger.info("Flushing VRAM between splits...")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                logger.info(f"VRAM after flush: {torch.cuda.memory_allocated()/1e9:.1f} GB allocated")
 
     if wandb_key:
         wandb.finish()
