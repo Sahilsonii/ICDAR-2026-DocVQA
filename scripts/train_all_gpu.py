@@ -137,40 +137,40 @@ def download_dataset(split="val", cache_dir="data/raw"):
 
 def prepare_eval_data(dataset):
     """
-    Convert dataset into inference samples (NO ground truth) + separate GT lookup.
-
-    This prevents data leakage: the model never sees answers during inference.
-    Ground truth is kept in a separate dict for post-inference evaluation only.
-
-    Returns:
-        eval_samples: List of dicts with image, question, question_id, domain, doc_id, pages
-                      (NO 'answer' key — model must not see ground truth)
-        ground_truth: Dict mapping question_id -> answer (empty for test split)
+    Convert dataset into inference samples using lazy indexing to prevent OOM.
     """
-    from src.data_loader import get_all_qa_pairs
-
     eval_samples = []
     ground_truth = {}
 
-    for item in dataset:
-        for qa in get_all_qa_pairs(item):
-            eval_samples.append({
-                "image": qa["pages"][0] if qa["pages"] else None,
-                "pages": qa["pages"],       # All pages for multi-page parsing
-                "question": qa["question"],
-                "question_id": qa["question_id"],
-                "domain": qa["doc_category"],
-                "doc_id": qa["doc_id"],
-                # NO "answer" key — inference must be blind to ground truth
-            })
-            if qa["ground_truth"] is not None:
-                ground_truth[qa["question_id"]] = qa["ground_truth"]
+    doc_ids = dataset["doc_id"]
+    domains = dataset["doc_category"]
+    questions_col = dataset["questions"]
+    answers_col = dataset["answers"] if "answers" in dataset.column_names else None
 
-    # Sanity check: ensure no leakage
-    for s in eval_samples:
-        assert "answer" not in s, (
-            f"DATA LEAKAGE: Sample {s['question_id']} contains 'answer' key!"
-        )
+    from tqdm import tqdm
+    for idx in tqdm(range(len(dataset)), desc="Preparing evaluation data"):
+        doc_id = doc_ids[idx]
+        domain = domains[idx]
+        questions = questions_col[idx]
+        answers = answers_col[idx] if answers_col is not None else {}
+        if answers is None:
+            answers = {}
+        
+        ans_map = dict(zip(
+            answers.get("question_id", []),
+            answers.get("answer", [])
+        ))
+
+        for qid, q in zip(questions["question_id"], questions["question"]):
+            eval_samples.append({
+                "dataset_idx": idx,
+                "question": q,
+                "question_id": qid,
+                "domain": domain,
+                "doc_id": doc_id,
+            })
+            if ans_map.get(qid) is not None:
+                ground_truth[qid] = ans_map[qid]
 
     logger.info(
         f"Prepared {len(eval_samples)} inference samples, "
@@ -185,7 +185,7 @@ def prepare_eval_data(dataset):
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 2 — DOCUMENT PARSING (Docling)
 # ═══════════════════════════════════════════════════════════════════════════
-def parse_documents(samples, use_parser=True):
+def parse_documents(samples, dataset, use_parser=True):
     """
     Parse all unique documents using the Docling parser for text extraction.
 
@@ -194,6 +194,7 @@ def parse_documents(samples, use_parser=True):
 
     Args:
         samples: List of eval sample dicts
+        dataset: HuggingFace dataset object for lazy image loading
         use_parser: If False, skip parsing (pure VLM-only mode)
 
     Returns:
@@ -212,16 +213,18 @@ def parse_documents(samples, use_parser=True):
     for s in samples:
         if s["doc_id"] not in unique_docs:
             unique_docs[s["doc_id"]] = {
-                "pages": s["pages"],
+                "dataset_idx": s["dataset_idx"],
                 "domain": s["domain"],
             }
 
     logger.info(f"Parsing {len(unique_docs)} unique documents with Docling...")
 
     doc_texts = {}
-    for doc_id, doc_info in unique_docs.items():
+    from tqdm import tqdm
+    for doc_id, doc_info in tqdm(unique_docs.items(), desc="Parsing documents"):
         try:
-            parsed_text = parser.parse(doc_info["pages"])
+            pages = dataset[doc_info["dataset_idx"]]["document"]
+            parsed_text = parser.parse(pages)
             doc_texts[doc_id] = parsed_text
             logger.info(
                 f"  ✓ Parsed {doc_id} ({doc_info['domain']}): "
@@ -241,7 +244,7 @@ def parse_documents(samples, use_parser=True):
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 3 — INFERENCE (Qwen VLM + parsed context)
 # ═══════════════════════════════════════════════════════════════════════════
-def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None):
+def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samples=None):
     """
     Run zero-shot inference with Qwen VLM.
 
@@ -259,6 +262,7 @@ def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None)
         adapter_path: Path to fine-tuned adapter (or None for zero-shot)
         samples: List of dicts WITHOUT 'answer' key
         doc_texts: Dict mapping doc_id -> parsed text from Docling
+        dataset: HuggingFace dataset context used to dynamically fetch images
         max_samples: Limit number of samples (for debugging)
 
     Returns:
@@ -347,9 +351,11 @@ def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None)
 
         # ── Construct VLM message ─────────────────────────────────────────
         # OOM Prevention: Dynamically shrink huge images before tokenization
-        img = item["image"]
+        pages = dataset[item["dataset_idx"]]["document"]
+        img = pages[0] if pages else None
+        
         max_dim = 1024
-        if max(img.size) > max_dim:
+        if img and max(img.size) > max_dim:
             import PIL
             from PIL import Image
             ratio = max_dim / max(img.size)
@@ -374,7 +380,7 @@ def run_inference(model_key, adapter_path, samples, doc_texts, max_samples=None)
             prompt = (
                 f"User: <image>\n{question_with_context}\nAssistant:"
             )
-            inputs = processor(text=prompt, images=item["image"], return_tensors="pt")
+            inputs = processor(text=prompt, images=img, return_tensors="pt")
 
         inputs = inputs.to(model.device)
         with torch.no_grad():
@@ -613,12 +619,14 @@ def run_pipeline_for_split(split, args):
 
     # Step 2: Parse documents with Docling
     logger.info("━━━ STEP 2/5: Document Parsing (Docling) ━━━")
-    doc_texts = parse_documents(eval_samples, use_parser=not args.no_parser)
+    doc_texts = parse_documents(eval_samples, dataset, use_parser=not args.no_parser)
 
     # Step 3: Inference (model never sees ground truth)
     logger.info("━━━ STEP 3/5: VLM Inference ━━━")
+    if args.max_samples:
+        eval_samples = eval_samples[:args.max_samples]
     predictions = run_inference(
-        args.model, args.adapter_path, eval_samples, doc_texts, args.max_samples
+        args.model, args.adapter_path, eval_samples, doc_texts, dataset, args.max_samples
     )
 
     # Step 4: Evaluation (val only — test has no public GT)
