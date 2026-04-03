@@ -48,6 +48,12 @@ Image.MAX_IMAGE_PIXELS = None
 # ── OOM fix: reduce allocator fragmentation ───────────────────────────────
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# ── Use cached model/processor to avoid HuggingFace timeout storms ─────────
+# The model shards are already downloaded. This prevents 10+ min of retries
+# when the lab's internet is slow or HuggingFace is rate-limiting.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -385,12 +391,18 @@ def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samp
         inputs = inputs.to(model.device)
         with torch.no_grad():
             generated_ids = model.generate(
-                **inputs, max_new_tokens=256, do_sample=False
+                **inputs, max_new_tokens=512, do_sample=False
             )
 
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         full_output = processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
         formatted = extract_and_format_answer(full_output)
+
+        # Debug: log first 3 raw outputs to verify FINAL ANSWER: extraction
+        if len(predictions) < 3:
+            logger.info(f"  [DEBUG] Q: {item['question'][:80]}")
+            logger.info(f"  [DEBUG] Raw output: {full_output[:200]}")
+            logger.info(f"  [DEBUG] Extracted: {formatted}")
 
         predictions.append({
             "question_id": item["question_id"],

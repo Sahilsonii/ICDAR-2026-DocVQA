@@ -50,19 +50,40 @@ def extract_and_format_answer(raw_output: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _extract_answer(raw_output: str) -> str:
-    """Extract the answer portion from raw model output."""
-    # Look for explicit "FINAL ANSWER:" marker
-    match = re.search(
-        r"FINAL ANSWER:\s*(.+?)(?:\n|$)",
-        raw_output,
-        re.IGNORECASE | re.DOTALL
-    )
-    if match:
-        return match.group(1).strip()
+    """Extract the answer portion from raw model output.
+    
+    Uses the same extraction method as the official evaluator:
+    split on "FINAL ANSWER:" and take the last part.
+    """
+    marker = "FINAL ANSWER:"
+    
+    # Primary: official split method (case-insensitive)
+    upper = raw_output.upper()
+    if marker in upper:
+        # Find position in the original string to preserve casing
+        idx = upper.rfind(marker)
+        answer = raw_output[idx + len(marker):].strip()
+        # Take first line only (stop at newline) to avoid trailing reasoning
+        answer = answer.split("\n")[0].strip()
+        if answer:
+            return answer
 
-    # Fallback: take the last non-empty line
+    # Secondary: look for "Answer:" prefix (common Qwen output pattern)
+    for prefix in ["Answer:", "ANSWER:", "answer:"]:
+        if prefix in raw_output:
+            idx = raw_output.rfind(prefix)
+            answer = raw_output[idx + len(prefix):].strip()
+            answer = answer.split("\n")[0].strip()
+            if answer:
+                return answer
+
+    # Fallback: take the last non-empty line (model might just output the answer directly)
     lines = [l.strip() for l in raw_output.strip().split("\n") if l.strip()]
-    return lines[-1] if lines else "Unknown"
+    if lines:
+        # Return the last line, which is most likely the answer
+        return lines[-1]
+    
+    return "Unknown"
 
 
 def _normalize_dates(text: str) -> str:
