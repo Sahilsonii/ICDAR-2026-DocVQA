@@ -48,11 +48,9 @@ Image.MAX_IMAGE_PIXELS = None
 # ── OOM fix: reduce allocator fragmentation ───────────────────────────────
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-# ── Use cached model/processor to avoid HuggingFace timeout storms ─────────
-# The model shards are already downloaded. This prevents 10+ min of retries
-# when the lab's internet is slow or HuggingFace is rate-limiting.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# ── NOTE: HF_HUB_OFFLINE is set dynamically in run_inference() for model loading ──
+# We do NOT set it globally because download_dataset() may need internet
+# for first-time dataset downloads.
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -303,6 +301,11 @@ def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samp
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
+    # Force offline mode for model/processor loading — they are already cached.
+    # This prevents 10+ min of HuggingFace timeout retries on slow lab networks.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     processor.image_processor.min_pixels = 256 * 28 * 28
     processor.image_processor.max_pixels = 512 * 28 * 28
@@ -420,9 +423,6 @@ def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samp
     logger.info(f"Inference complete: {len(predictions)} predictions")
 
     # ── Critical: explicitly delete model + processor to release all VRAM ──
-    # free_gpu_memory(model) alone does NOT work because the caller still holds
-    # a reference via the `model` local variable inside run_inference — the del
-    # inside free_gpu_memory only removes the copy passed in, not the original.
     del model, processor
     gc.collect()
     if torch.cuda.is_available():
@@ -431,6 +431,10 @@ def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samp
         alloc = torch.cuda.memory_allocated() / 1e9
         reserv = torch.cuda.memory_reserved() / 1e9
         logger.info(f"VRAM after model unload: {alloc:.1f} GB allocated | {reserv:.1f} GB reserved")
+
+    # Reset offline mode so the next split's dataset download can use internet
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
 
     return predictions
 
@@ -739,7 +743,10 @@ def main():
                 logger.info(f"VRAM after flush: {torch.cuda.memory_allocated()/1e9:.1f} GB allocated")
 
     if wandb_key:
-        wandb.finish()
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
