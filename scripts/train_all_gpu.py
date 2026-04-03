@@ -308,7 +308,7 @@ def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samp
 
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     processor.image_processor.min_pixels = 256 * 28 * 28
-    processor.image_processor.max_pixels = 512 * 28 * 28
+    processor.image_processor.max_pixels = 1024 * 28 * 28  # ~800K px: enough to read document text
 
     # Force all layers onto GPU
     total_vram = (
@@ -363,7 +363,7 @@ def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samp
         pages = dataset[item["dataset_idx"]]["document"]
         img = pages[0] if pages else None
         
-        max_dim = 1024
+        max_dim = 1536
         if img and max(img.size) > max_dim:
             import PIL
             from PIL import Image
@@ -401,10 +401,10 @@ def run_inference(model_key, adapter_path, samples, doc_texts, dataset, max_samp
         full_output = processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
         formatted = extract_and_format_answer(full_output)
 
-        # Debug: log first 3 raw outputs to verify FINAL ANSWER: extraction
-        if len(predictions) < 3:
+        # Debug: log first 5 raw outputs to verify FINAL ANSWER: extraction
+        if len(predictions) < 5:
             logger.info(f"  [DEBUG] Q: {item['question'][:80]}")
-            logger.info(f"  [DEBUG] Raw output: {full_output[:200]}")
+            logger.info(f"  [DEBUG] Raw output: {full_output[:300]}")
             logger.info(f"  [DEBUG] Extracted: {formatted}")
 
         predictions.append({
